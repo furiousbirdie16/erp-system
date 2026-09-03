@@ -1,0 +1,2196 @@
+import { supabase } from "@/integrations/supabase/client";
+import type { Item, ItemVariation, Supplier, Customer, PurchaseOrder, PurchaseOrderItem, Quotation, QuotationItem, Invoice, InvoiceItem, InventoryMovement, OverseasSupplier, OverseasPurchaseOrder, OverseasPurchaseOrderItem, ShipmentTracking, OnlineSale, Loan, CashAccount, CashTransaction, Payable, LoanPayment } from "@/types/database";
+import { logActivity } from "@/lib/activity-log";
+import { applyVariationDelta } from "@/lib/variations";
+import { recordMovement } from "@/lib/inventoryLog";
+import { payablePosting } from "@/lib/payable-posting";
+
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _sb: any = supabase as any;
+const _from = (table: string) => _sb.from(table);
+
+/**
+ * Read every row of a query, a page at a time.
+ *
+ * PostgREST caps a response at 1000 rows and reports no error when it truncates,
+ * so an unpaginated read of a growing table silently starts losing its oldest
+ * rows. `build` is called once per page because a range has to be applied to a
+ * fresh builder.
+ *
+ * The query must order by something unique last — ties that straddle a page
+ * boundary can otherwise be served twice or skipped entirely.
+ */
+const fetchAllRows = async <T>(build: () => any): Promise<T[]> => {
+  const pageSize = 1000;
+  const all: T[] = [];
+  for (let page = 0; ; page++) {
+    const fromIdx = page * pageSize;
+    const { data, error } = await build().range(fromIdx, fromIdx + pageSize - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    all.push(...(data as T[]));
+    if (data.length < pageSize) break;
+  }
+  return all;
+};
+
+/** Read the branch-scoped stock row (returns zeros if missing). */
+async function getBranchStock(itemId: string, branchId: string) {
+  const { data } = await _from("item_branch_stock")
+    .select("warehouse_quantity, store_quantity, quantity, open_roll_remaining, units_per_stock")
+    .eq("item_id", itemId)
+    .eq("branch_id", branchId)
+    .maybeSingle();
+  const r = (data as any) || {};
+  return {
+    warehouse_quantity: Number(r.warehouse_quantity || 0),
+    store_quantity: Number(r.store_quantity || 0),
+    quantity: Number(r.quantity || 0),
+    open_roll_remaining: Number(r.open_roll_remaining || 0),
+    units_per_stock: Number(r.units_per_stock || 1),
+  };
+}
+
+/** RPC wrapper — mutates item_branch_stock atomically. */
+async function applyBranchStockRpc(args: {
+  itemId: string;
+  branchId: string;
+  location: "warehouse" | "store";
+  deltaStock: number;
+  deltaOpen?: number;
+  unitsPerStock?: number | null;
+}) {
+  const { data, error } = await _sb.rpc("apply_branch_stock_change", {
+    _item_id: args.itemId,
+    _branch_id: args.branchId,
+    _location: args.location,
+    _delta_stock: args.deltaStock,
+    _delta_open: args.deltaOpen ?? 0,
+    _units_per_stock: args.unitsPerStock ?? null,
+  });
+  if (error) throw error;
+  return (Array.isArray(data) ? data[0] : data) as {
+    warehouse_quantity: number;
+    store_quantity: number;
+    quantity: number;
+    open_roll_remaining: number;
+    units_per_stock: number;
+    wh_before: number;
+    st_before: number;
+    open_before: number;
+  };
+}
+
+// ---------- Item Variations ----------
+export const getItemVariations = async (itemId?: string): Promise<ItemVariation[]> => {
+  let q = from("item_variations").select("*, items(*)").order("name");
+  if (itemId) q = q.eq("item_id", itemId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data as ItemVariation[];
+};
+
+export const createItemVariation = async (v: Partial<ItemVariation>) => {
+  const { data, error } = await from("item_variations").insert(v).select().single();
+  if (error) throw error;
+  return data as ItemVariation;
+};
+
+export const updateItemVariation = async (id: string, v: Partial<ItemVariation>) => {
+  const { data, error } = await from("item_variations").update(v).eq("id", id).select().single();
+  if (error) throw error;
+  return data as ItemVariation;
+};
+
+export const deleteItemVariation = async (id: string) => {
+  const { error } = await from("item_variations").delete().eq("id", id);
+  if (error) throw error;
+};
+
+/**
+ * Apply a sale (qty>0) or restore (qty<0) against `item_branch_stock` for the
+ * TRANSACTION'S branch (never the currently-viewed branch). Variation-aware.
+ * All sales deduct from the branch's store bucket; restores add back to store.
+ */
+export const applyStockChange = async (params: {
+  itemId: string;
+  variationId: string | null;
+  branchId: string;
+  qty: number; // positive = deduct, negative = restore
+  referenceId: string;
+  referenceType: string;
+  movementType: "in_po" | "out_invoice" | "out_online_sale";
+  notes?: string;
+}) => {
+  const { itemId, variationId, branchId, qty, referenceId, referenceType, movementType, notes } = params;
+  if (qty === 0) return;
+  if (!branchId) throw new Error("applyStockChange: branchId is required");
+
+  const { data: item } = await _from("items").select("base_unit, units_per_stock").eq("id", itemId).maybeSingle();
+  const baseUnit = (item as any)?.base_unit ?? "pcs";
+  const itemUps = Number((item as any)?.units_per_stock || 1);
+
+  // Read current branch stock (before mutation) for ledger + variation math.
+  const cur = await getBranchStock(itemId, branchId);
+  const effectiveUps = Math.max(cur.units_per_stock || 0, itemUps || 0, 1);
+
+  let baseUnitsMoved = qty;
+  let deltaStock = -qty; // default: deduct N stock units from store
+  let deltaOpen = 0;
+
+  if (variationId) {
+    const { data: v } = await _from("item_variations").select("type, factor").eq("id", variationId).single();
+    const variation = v as any;
+    if (!variation) return;
+    baseUnitsMoved = Number(variation.factor) * qty;
+
+    if (variation.type === "cut") {
+      // Simulate variation delta on the branch row
+      const sim = applyVariationDelta(
+        { quantity: cur.quantity, open_roll_remaining: cur.open_roll_remaining, units_per_stock: effectiveUps },
+        { type: "cut", factor: Number(variation.factor) },
+        qty,
+      );
+      const stockConsumed = cur.quantity - sim.quantity; // + = consumed, - = restored
+      deltaStock = -stockConsumed;
+      deltaOpen = sim.open_roll_remaining - cur.open_roll_remaining;
+    } else {
+      // "pack" variation: deducts baseUnitsMoved stock units directly
+      deltaStock = -baseUnitsMoved;
+    }
+  }
+
+  const result = await applyBranchStockRpc({
+    itemId,
+    branchId,
+    location: "store",
+    deltaStock,
+    deltaOpen,
+    unitsPerStock: variationId ? effectiveUps : null,
+  });
+
+  await recordMovement({
+    itemId,
+    variationId: variationId || null,
+    branchId,
+    type: movementType,
+    quantity: Math.abs(baseUnitsMoved),
+    unit: baseUnit || (variationId ? "m" : "pcs"),
+    location: "store",
+    referenceId,
+    referenceType,
+    notes: notes || (qty < 0 ? "Stock restored" : "Stock deducted"),
+    balanceBefore: cur.store_quantity,
+    balanceAfter: result.store_quantity,
+    openBefore: cur.open_roll_remaining,
+    openAfter: result.open_roll_remaining,
+  });
+};
+
+/**
+ * Set absolute warehouse/store quantities for an item in a SPECIFIC branch.
+ * `item_branch_stock` is the single source of truth for stock, so manual edits
+ * (item form, bulk edit upload) must go through here — writing the legacy
+ * `items.warehouse_quantity` / `items.store_quantity` columns has no effect.
+ */
+export const setBranchQuantities = async (params: {
+  itemId: string;
+  branchId: string;
+  warehouse?: number | null;
+  store?: number | null;
+  notes?: string;
+}) => {
+  const { itemId, branchId, warehouse, store, notes } = params;
+  if (!branchId) throw new Error("A branch must be selected to edit quantities");
+
+  const cur = await getBranchStock(itemId, branchId);
+  const targets: { location: "warehouse" | "store"; target: number; before: number }[] = [];
+  if (warehouse !== null && warehouse !== undefined && Number(warehouse) !== cur.warehouse_quantity) {
+    targets.push({ location: "warehouse", target: Number(warehouse), before: cur.warehouse_quantity });
+  }
+  if (store !== null && store !== undefined && Number(store) !== cur.store_quantity) {
+    targets.push({ location: "store", target: Number(store), before: cur.store_quantity });
+  }
+  if (targets.length === 0) return;
+
+  const { data: item } = await _from("items").select("base_unit").eq("id", itemId).maybeSingle();
+  const baseUnit = (item as any)?.base_unit ?? "pcs";
+
+  for (const t of targets) {
+    const delta = t.target - t.before;
+    const result = await applyBranchStockRpc({
+      itemId,
+      branchId,
+      location: t.location,
+      deltaStock: delta,
+    });
+    await recordMovement({
+      itemId,
+      branchId,
+      type: delta > 0 ? "adjust_surplus" : "adjust_missing",
+      quantity: Math.abs(delta),
+      unit: baseUnit,
+      location: t.location,
+      referenceType: "manual_adjustment",
+      notes: notes || "Manual quantity edit",
+      balanceBefore: t.before,
+      balanceAfter: t.location === "warehouse" ? result.warehouse_quantity : result.store_quantity,
+    });
+  }
+};
+
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const db = (supabase as any);
+const from = (table: string) => db.from(table);
+
+// Items
+export const getItems = async (): Promise<Item[]> => {
+  const { data, error } = await from("items").select("*").neq("status", "archived").order("name");
+  if (error) throw error;
+  return data;
+};
+
+/**
+ * Items with their real on-hand quantity.
+ *
+ * `items.quantity` is a legacy column that stock movements stopped maintaining
+ * when per-branch stock was introduced — item_branch_stock is the source of
+ * truth. Anything showing stock to a user must go through here, or it will show
+ * a figure frozen at the migration date.
+ *
+ * Pass a branchId to scope to one branch; omit it to total every branch.
+ */
+export const getItemsWithStock = async (branchId?: string | null): Promise<Item[]> => {
+  const items = await getItems();
+  let stockQ = from("item_branch_stock").select("item_id, quantity, warehouse_quantity, store_quantity, open_roll_remaining");
+  if (branchId) stockQ = stockQ.eq("branch_id", branchId);
+  const { data: stock, error } = await stockQ;
+  if (error) throw error;
+
+  const byItem: Record<string, { quantity: number; warehouse: number; store: number; open: number }> = {};
+  for (const r of (stock as any[]) || []) {
+    const e = (byItem[r.item_id] ||= { quantity: 0, warehouse: 0, store: 0, open: 0 });
+    e.quantity += Number(r.quantity || 0);
+    e.warehouse += Number(r.warehouse_quantity || 0);
+    e.store += Number(r.store_quantity || 0);
+    e.open += Number(r.open_roll_remaining || 0);
+  }
+
+  return items.map((i: any) => {
+    const s = byItem[i.id];
+    return {
+      ...i,
+      quantity: s?.quantity ?? 0,
+      warehouse_quantity: s?.warehouse ?? 0,
+      store_quantity: s?.store ?? 0,
+      open_roll_remaining: s?.open ?? 0,
+    };
+  });
+};
+
+export const getArchivedItems = async (): Promise<Item[]> => {
+  const { data, error } = await from("items").select("*").eq("status", "archived").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const getAllItems = async (): Promise<Item[]> => {
+  const { data, error } = await from("items").select("*").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const archiveItems = async (ids: string[], email?: string | null) => {
+  const { error } = await from("items").update({
+    status: "archived",
+    archived_at: new Date().toISOString(),
+    archived_by_email: email || null,
+    updated_at: new Date().toISOString(),
+  }).in("id", ids);
+  if (error) throw error;
+  for (const id of ids) await logActivity("archived_item", "inventory", id);
+};
+
+export const unarchiveItems = async (ids: string[]) => {
+  const { error } = await from("items").update({
+    status: "active",
+    archived_at: null,
+    archived_by_email: null,
+    updated_at: new Date().toISOString(),
+  }).in("id", ids);
+  if (error) throw error;
+  for (const id of ids) await logActivity("unarchived_item", "inventory", id);
+};
+
+export const createItem = async (item: Partial<Item>) => {
+  const { data, error } = await from("items").insert(item).select().single();
+  if (error) throw error;
+  const created = data as Item;
+  await logActivity("created_item", "inventory", created.id, { name: created.name, sku: created.sku });
+  return created;
+};
+
+export const updateItem = async (id: string, item: Partial<Item>) => {
+  const { data: oldData } = await from("items").select("quantity").eq("id", id).single();
+  const oldQty = (oldData as any)?.quantity;
+  const { data, error } = await from("items").update({ ...item, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  const updated = data as Item;
+  const details: Record<string, unknown> = { name: updated.name, sku: updated.sku };
+  if (item.quantity !== undefined && item.quantity !== oldQty) {
+    details.quantity_from = oldQty;
+    details.quantity_to = item.quantity;
+  }
+  await logActivity("updated_item", "inventory", id, details);
+  return updated;
+};
+
+export const deleteItem = async (id: string) => {
+  const { error } = await from("items").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_item", "inventory", id);
+};
+
+// Suppliers
+export const getSuppliers = async (): Promise<Supplier[]> => {
+  const { data, error } = await from("suppliers").select("*").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const createSupplier = async (s: Partial<Supplier>) => {
+  const { data, error } = await from("suppliers").insert(s).select().single();
+  if (error) throw error;
+  return data as Supplier;
+};
+
+export const updateSupplier = async (id: string, s: Partial<Supplier>) => {
+  const { data, error } = await from("suppliers").update(s).eq("id", id).select().single();
+  if (error) throw error;
+  return data as Supplier;
+};
+
+export const deleteSupplier = async (id: string) => {
+  const { error } = await from("suppliers").delete().eq("id", id);
+  if (error) throw error;
+};
+
+// Loans
+export const getLoans = async (): Promise<Loan[]> => {
+  const { data, error } = await from("loans").select("*").order("due_date", { ascending: true, nullsFirst: false });
+  if (error) throw error;
+  return data;
+};
+
+export const createLoan = async (l: Partial<Loan>) => {
+  const { data, error } = await from("loans").insert(l).select().single();
+  if (error) throw error;
+  const created = data as Loan;
+  await logActivity("created_loan", "loan", created.id, { lender: created.lender, principal_amount: created.principal_amount });
+  return created;
+};
+
+export const updateLoan = async (id: string, l: Partial<Loan>) => {
+  const { data, error } = await from("loans").update({ ...l, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  const updated = data as Loan;
+  await logActivity("updated_loan", "loan", id, { lender: updated.lender });
+  return updated;
+};
+
+export const deleteLoan = async (id: string) => {
+  const { error } = await from("loans").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_loan", "loan", id);
+};
+
+// ---- Loan interest payments -------------------------------------------------
+
+export const getLoanPayments = async (): Promise<LoanPayment[]> =>
+  fetchAllRows<LoanPayment>(() =>
+    from("loan_payments")
+      .select("*")
+      .order("payment_date", { ascending: false })
+      .order("id", { ascending: false }),
+  );
+
+/**
+ * Takes the interest out of the account it was paid from.
+ *
+ * A normal withdrawal, so it shows in the ledger and the running balance like
+ * any other. The unique index on loan_payment_id is what makes this safe to
+ * repeat: a second posting for the same payment fails rather than deducting the
+ * interest twice.
+ */
+const postLoanPayment = async (payment: LoanPayment) => {
+  const { data: existing } = await from("cash_transactions")
+    .select("id, amount, account_id, txn_date").eq("loan_payment_id", payment.id).maybeSingle();
+
+  const accountId = payment.cash_account_id;
+  const amount = Number(payment.amount || 0);
+
+  // Recorded without an account, or for nothing: no money moved, so no entry.
+  if (!accountId || amount <= 0) {
+    if (existing) await deleteCashTransaction((existing as any).id);
+    return;
+  }
+
+  // The lender is the payee, read from the loan so the ledger row says who was
+  // paid rather than carrying a loan id nobody can read.
+  const { data: loan } = await from("loans").select("lender").eq("id", payment.loan_id).maybeSingle();
+
+  const entry = {
+    account_id: accountId,
+    txn_date: payment.payment_date,
+    direction: "out",
+    amount,
+    category: "Loan Interest",
+    payee: (loan as any)?.lender || "",
+    reference: "",
+    notes: payment.notes || "Interest payment",
+  };
+
+  if (existing) {
+    const { error } = await from("cash_transactions")
+      .update({ ...entry, updated_at: new Date().toISOString() })
+      .eq("id", (existing as any).id);
+    if (error) throw error;
+    return;
+  }
+
+  const actor = await currentActor();
+  const { error } = await from("cash_transactions").insert({
+    ...entry,
+    loan_payment_id: payment.id,
+    created_by: actor.id,
+    created_by_email: actor.email,
+  });
+  if (error) throw error;
+};
+
+export const createLoanPayment = async (p: Partial<LoanPayment>) => {
+  const { data, error } = await from("loan_payments").insert({
+    loan_id: p.loan_id,
+    payment_date: p.payment_date,
+    amount: p.amount,
+    cash_account_id: p.cash_account_id || null,
+    notes: p.notes || "",
+  }).select().single();
+  if (error) throw error;
+  const created = data as LoanPayment;
+  await logActivity("created_loan_payment", "loan", created.loan_id, { amount: created.amount });
+  await postLoanPayment(created);
+  return created;
+};
+
+export const deleteLoanPayment = async (id: string) => {
+  // Remove the withdrawal first: once the payment is gone its posting is
+  // unattributable, and ON DELETE SET NULL would strand it in the ledger.
+  const { data: posted } = await from("cash_transactions")
+    .select("id").eq("loan_payment_id", id).maybeSingle();
+  if (posted) await deleteCashTransaction((posted as any).id);
+
+  const { error } = await from("loan_payments").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_loan_payment", "loan", id);
+};
+
+// Overseas Suppliers
+export const getOverseasSuppliers = async (): Promise<OverseasSupplier[]> => {
+  const { data, error } = await from("overseas_suppliers").select("*").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const createOverseasSupplier = async (s: Partial<OverseasSupplier>) => {
+  const { data, error } = await from("overseas_suppliers").insert(s).select().single();
+  if (error) throw error;
+  return data as OverseasSupplier;
+};
+
+export const updateOverseasSupplier = async (id: string, s: Partial<OverseasSupplier>) => {
+  const { data, error } = await from("overseas_suppliers").update({ ...s, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  return data as OverseasSupplier;
+};
+
+export const deleteOverseasSupplier = async (id: string) => {
+  const { error } = await from("overseas_suppliers").delete().eq("id", id);
+  if (error) throw error;
+};
+
+// Customers
+export const getCustomers = async (): Promise<Customer[]> => {
+  const { data, error } = await from("customers").select("*").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const createCustomer = async (c: Partial<Customer>) => {
+  const { data, error } = await from("customers").insert(c).select().single();
+  if (error) throw error;
+  return data as Customer;
+};
+
+export const updateCustomer = async (id: string, c: Partial<Customer>) => {
+  const { data, error } = await from("customers").update(c).eq("id", id).select().single();
+  if (error) throw error;
+  return data as Customer;
+};
+
+export const deleteCustomer = async (id: string) => {
+  const { error } = await from("customers").delete().eq("id", id);
+  if (error) throw error;
+};
+
+// Purchase Orders
+export const getPurchaseOrders = async (): Promise<PurchaseOrder[]> => {
+  const { data, error } = await from("purchase_orders").select("*, suppliers(*)").order("created_at", { ascending: false });
+  if (error) throw error;
+  return data;
+};
+
+export const createPurchaseOrder = async (po: Partial<PurchaseOrder>) => {
+  const { data, error } = await from("purchase_orders").insert(po).select().single();
+  if (error) throw error;
+  const created = data as PurchaseOrder;
+  await logActivity("created_purchase_order", "purchase_order", created.id, { po_number: created.po_number });
+  return created;
+};
+
+export const updatePurchaseOrder = async (id: string, po: Partial<PurchaseOrder>) => {
+  // If the user is moving the PO into "received" status directly (e.g. via the edit form),
+  // auto-receive any outstanding quantities so inventory stock is added. Idempotent —
+  // already-received quantities are skipped.
+  const wantsReceived = (po as any)?.status === "received";
+  if (wantsReceived) {
+    const { data: lines } = await from("purchase_order_items").select("id, item_id, quantity, received_quantity").eq("po_id", id);
+    const toReceive = ((lines as any[]) || [])
+      .map((li: any) => ({
+        poItemId: li.id,
+        itemId: li.item_id ?? null,
+        quantity: Math.max(0, Number(li.quantity || 0) - Number(li.received_quantity || 0)),
+        location: "warehouse" as const,
+      }))
+      .filter((li) => li.quantity > 0);
+    if (toReceive.length > 0) {
+      await receivePO(id, toReceive);
+    }
+  }
+
+  const { data, error } = await from("purchase_orders").update({ ...po, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  return data as PurchaseOrder;
+};
+
+export const deletePurchaseOrder = async (id: string) => {
+  const { error } = await from("purchase_orders").delete().eq("id", id);
+  if (error) throw error;
+};
+
+export const getPOItems = async (poId: string): Promise<PurchaseOrderItem[]> => {
+  const { data, error } = await from("purchase_order_items").select("*, items(*)").eq("po_id", poId);
+  if (error) throw error;
+  return data;
+};
+
+export const createPOItems = async (items: Partial<PurchaseOrderItem>[]) => {
+  const { error } = await from("purchase_order_items").insert(items);
+  if (error) throw error;
+};
+
+export const deletePOItems = async (poId: string) => {
+  const { error } = await from("purchase_order_items").delete().eq("po_id", poId);
+  if (error) throw error;
+};
+
+// Receive PO
+export const receivePO = async (
+  poId: string,
+  itemsToReceive: { poItemId: string; itemId: string | null; quantity: number; location?: "warehouse" | "store" }[],
+  receivedDate?: string,
+  branchOverride?: string | null,
+) => {
+  const rcvDate = receivedDate || new Date().toISOString().split("T")[0];
+  const { data: poRow } = await from("purchase_orders").select("branch_id, status").eq("id", poId).single();
+  const originalBranchId: string | null = (poRow as any)?.branch_id ?? null;
+  const poBranchId: string | null = branchOverride ?? originalBranchId;
+  if (!poBranchId) throw new Error("This PO has no branch assigned. Edit the PO and set its branch before receiving.");
+
+  if (branchOverride && branchOverride !== originalBranchId) {
+    await from("purchase_orders").update({ branch_id: branchOverride, updated_at: new Date().toISOString() }).eq("id", poId);
+    await logActivity("changed_po_branch", "purchase_order", poId, { from: originalBranchId, to: branchOverride });
+  }
+
+  for (const item of itemsToReceive) {
+    const { data: poItem } = await from("purchase_order_items").select("received_quantity").eq("id", item.poItemId).single();
+    const newReceived = ((poItem as any)?.received_quantity || 0) + item.quantity;
+    await from("purchase_order_items").update({ received_quantity: newReceived, received_date: rcvDate }).eq("id", item.poItemId);
+
+    if (!item.itemId) continue;
+
+    const location: "warehouse" | "store" = item.location || "warehouse";
+    const result = await applyBranchStockRpc({
+      itemId: item.itemId,
+      branchId: poBranchId,
+      location,
+      deltaStock: item.quantity,
+    });
+    const before = location === "store" ? result.st_before : result.wh_before;
+    const after = location === "store" ? result.store_quantity : result.warehouse_quantity;
+
+    await recordMovement({
+      itemId: item.itemId,
+      branchId: poBranchId,
+      type: "in_po",
+      quantity: item.quantity,
+      unit: "pcs",
+      location,
+      referenceId: poId,
+      referenceType: "purchase_order",
+      notes: `Received from PO on ${rcvDate} → ${location}`,
+      balanceBefore: before,
+      balanceAfter: after,
+    });
+  }
+
+
+  const { data: allItems } = await from("purchase_order_items").select("quantity, received_quantity").eq("po_id", poId);
+  const allReceived = (allItems as any[])?.every((i: any) => i.received_quantity >= i.quantity);
+  const someReceived = (allItems as any[])?.some((i: any) => i.received_quantity > 0);
+  const cur = (poRow as any)?.status;
+  let newStatus: string;
+  if (cur === "closed") {
+    newStatus = cur;
+  } else if (allReceived) {
+    newStatus = "received";
+  } else if (someReceived) {
+    newStatus = "partially_received";
+  } else {
+    newStatus = "draft";
+  }
+  await from("purchase_orders").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", poId);
+  await logActivity("received_purchase_order", "purchase_order", poId, { status: newStatus });
+};
+
+// Undo Receive — reverses received quantities for selected PO line items and deducts inventory
+export const unreceivePO = async (
+  poId: string,
+  itemsToUnreceive: { poItemId: string; itemId: string | null; quantity: number }[],
+) => {
+  const { data: poRow } = await from("purchase_orders").select("branch_id").eq("id", poId).single();
+  const poBranchId: string | null = (poRow as any)?.branch_id ?? null;
+
+  for (const item of itemsToUnreceive) {
+    if (item.quantity <= 0) continue;
+    const { data: poItem } = await from("purchase_order_items").select("received_quantity").eq("id", item.poItemId).single();
+    const currentReceived = (poItem as any)?.received_quantity || 0;
+    const undoQty = Math.min(item.quantity, currentReceived);
+    if (undoQty <= 0) continue;
+    const newReceived = currentReceived - undoQty;
+    await from("purchase_order_items")
+      .update({ received_quantity: newReceived, received_date: newReceived === 0 ? null : undefined })
+      .eq("id", item.poItemId);
+
+    if (item.itemId && poBranchId) {
+      const result = await applyBranchStockRpc({
+        itemId: item.itemId,
+        branchId: poBranchId,
+        location: "warehouse",
+        deltaStock: -undoQty,
+      });
+      await recordMovement({
+        itemId: item.itemId,
+        branchId: poBranchId,
+        type: "in_po",
+        quantity: undoQty,
+        unit: "pcs",
+        location: "warehouse",
+        referenceId: poId,
+        referenceType: "purchase_order_undo",
+        notes: `Undo receive from PO`,
+        balanceBefore: result.wh_before,
+        balanceAfter: result.warehouse_quantity,
+      });
+    }
+
+  }
+
+  const { data: allItems } = await from("purchase_order_items").select("quantity, received_quantity").eq("po_id", poId);
+  const allReceived = (allItems as any[])?.every((i: any) => i.received_quantity >= i.quantity);
+  const someReceived = (allItems as any[])?.some((i: any) => i.received_quantity > 0);
+  const newStatus = allReceived ? "received" : someReceived ? "partially_received" : "draft";
+  await from("purchase_orders").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", poId);
+  await logActivity("undo_receive_purchase_order", "purchase_order", poId, { status: newStatus });
+};
+
+// Quotations
+export const getQuotations = async (branchId?: string | null): Promise<Quotation[]> => {
+  let q = from("quotations").select("*, customers(*)").order("created_at", { ascending: false });
+  if (branchId) q = q.eq("branch_id", branchId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data;
+};
+
+export const createQuotation = async (q: Partial<Quotation>) => {
+  const { data, error } = await from("quotations").insert(q).select().single();
+  if (error) throw error;
+  const created = data as Quotation;
+  await logActivity("created_quotation", "quotation", created.id, { quotation_number: created.quotation_number });
+  return created;
+};
+
+export const updateQuotation = async (id: string, q: Partial<Quotation>) => {
+  const { data, error } = await from("quotations").update(q).eq("id", id).select().single();
+  if (error) throw error;
+  return data as Quotation;
+};
+
+export const revertQuotation = async (id: string) => {
+  const { error } = await from("quotations").update({ status: "draft" }).eq("id", id);
+  if (error) throw error;
+  await logActivity("reverted_quotation", "quotation", id);
+};
+
+export const deleteQuotation = async (id: string) => {
+  const { error } = await from("quotations").delete().eq("id", id);
+  if (error) throw error;
+};
+
+export const getQuotationItems = async (qId: string): Promise<QuotationItem[]> => {
+  const { data, error } = await from("quotation_items").select("*, items(*), item_variations(*)").eq("quotation_id", qId);
+  if (error) throw error;
+  return data;
+};
+
+export const createQuotationItems = async (items: Partial<QuotationItem>[]) => {
+  const { error } = await from("quotation_items").insert(items);
+  if (error) throw error;
+};
+
+export const deleteQuotationItems = async (qId: string) => {
+  const { error } = await from("quotation_items").delete().eq("quotation_id", qId);
+  if (error) throw error;
+};
+
+// Convert Quotation to Invoice
+export const convertQuotationToInvoice = async (quotationId: string) => {
+  const { data: quotation } = await from("quotations").select("*").eq("id", quotationId).single();
+  if (!quotation) throw new Error("Quotation not found");
+
+  const { data: qItems } = await from("quotation_items").select("*").eq("quotation_id", quotationId);
+  const q = quotation as any;
+  const invNumber = await generateInvoiceNumber();
+  const invoiceDate = new Date().toISOString().split("T")[0];
+
+  // Carry over payment terms / due date from the quotation.
+  // Priority: explicit payment_due_date > computed from payment_terms (relative to invoice date).
+  let dueDate: string | null = q.payment_due_date || null;
+  if (!dueDate && q.payment_terms != null) {
+    const d = new Date(invoiceDate);
+    d.setDate(d.getDate() + Number(q.payment_terms));
+    dueDate = d.toISOString().split("T")[0];
+  }
+
+  const { data: invoice, error } = await from("invoices").insert({
+    invoice_number: invNumber,
+    customer_id: q.customer_id,
+    quotation_id: quotationId,
+    status: "draft",
+    invoice_date: invoiceDate,
+    due_date: dueDate,
+    notes: q.notes,
+    total_amount: q.total_amount,
+    sales_agent: q.sales_agent || "",
+    branch_id: q.branch_id,
+  }).select().single();
+
+  if (error) throw error;
+
+  if (qItems && (qItems as any[]).length > 0) {
+    await from("invoice_items").insert(
+      (qItems as any[]).map((qi: any) => ({
+        invoice_id: (invoice as any).id,
+        item_id: qi.item_id,
+        item_name: qi.item_name,
+        quantity: qi.quantity,
+        unit_price: qi.unit_price,
+        variation_id: qi.variation_id,
+      }))
+    );
+  }
+
+  await from("quotations").update({ status: "accepted" }).eq("id", quotationId);
+  await logActivity("converted_quotation_to_invoice", "invoice", (invoice as any).id, { from_quotation: quotationId });
+  return invoice as Invoice;
+};
+
+// Invoices
+export const getInvoices = async (branchId?: string | null): Promise<Invoice[]> =>
+  fetchAllRows<Invoice>(() => {
+    let q = from("invoices")
+      .select("*, customers(*)")
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
+    if (branchId) q = q.eq("branch_id", branchId);
+    return q;
+  });
+
+export const createInvoice = async (inv: Partial<Invoice>) => {
+  const { data, error } = await from("invoices").insert(inv).select().single();
+  if (error) throw error;
+  const created = data as Invoice;
+  await logActivity("created_invoice", "invoice", created.id, { invoice_number: created.invoice_number });
+  return created;
+};
+
+export const updateInvoice = async (id: string, inv: Partial<Invoice>) => {
+  const { data, error } = await from("invoices").update({ ...inv, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  return data as Invoice;
+};
+
+export const deleteInvoice = async (id: string) => {
+  // If this invoice currently has stock deducted, restore inventory before deleting.
+  const { data: invRow } = await from("invoices").select("inventory_deducted, branch_id").eq("id", id).maybeSingle();
+  const stockCurrentlyDeducted = !!(invRow as any)?.inventory_deducted;
+  const branchId: string | null = (invRow as any)?.branch_id ?? null;
+
+  if (stockCurrentlyDeducted && branchId) {
+    const { data: invItems } = await from("invoice_items").select("*").eq("invoice_id", id);
+    for (const invItem of (invItems as any[]) || []) {
+      if (!invItem.item_id) continue;
+      await applyStockChange({
+        itemId: invItem.item_id,
+        variationId: invItem.variation_id || null,
+        branchId,
+        qty: -invItem.quantity, // restore
+        referenceId: id,
+        referenceType: "invoice_delete",
+        movementType: "in_po",
+        notes: "Restored — invoice deleted",
+      });
+    }
+  }
+
+  const { error } = await from("invoices").delete().eq("id", id);
+  if (error) throw error;
+};
+
+export const getInvoiceItems = async (invId: string): Promise<InvoiceItem[]> => {
+  const { data, error } = await from("invoice_items").select("*, items(*), item_variations(*)").eq("invoice_id", invId);
+  if (error) throw error;
+  return data;
+};
+
+export const createInvoiceItems = async (items: Partial<InvoiceItem>[]) => {
+  const { error } = await from("invoice_items").insert(items);
+  if (error) throw error;
+};
+
+export const deleteInvoiceItems = async (invId: string) => {
+  const { error } = await from("invoice_items").delete().eq("invoice_id", invId);
+  if (error) throw error;
+};
+
+// Internal: deduct stock for an invoice exactly once (idempotent via inventory_deducted flag)
+const deductInvoiceStockIfNeeded = async (invoiceId: string, notes: string) => {
+  const { data: invRow } = await from("invoices").select("inventory_deducted, branch_id").eq("id", invoiceId).maybeSingle();
+  if ((invRow as any)?.inventory_deducted) return false;
+  const branchId: string | null = (invRow as any)?.branch_id ?? null;
+  if (!branchId) throw new Error("This invoice has no branch assigned. Set the invoice branch before deducting stock.");
+
+  const { data: invItems } = await from("invoice_items").select("*").eq("invoice_id", invoiceId);
+  if (invItems) {
+    for (const invItem of invItems as any[]) {
+      if (!invItem.item_id) continue;
+      await applyStockChange({
+        itemId: invItem.item_id,
+        variationId: invItem.variation_id || null,
+        branchId,
+        qty: invItem.quantity,
+        referenceId: invoiceId,
+        referenceType: "invoice",
+        movementType: "out_invoice",
+        notes,
+      });
+    }
+  }
+  await from("invoices").update({ inventory_deducted: true, updated_at: new Date().toISOString() }).eq("id", invoiceId);
+  return true;
+};
+
+// Confirm Invoice (mark shipped - legacy "shipped not paid") - deduct stock once
+export const confirmInvoice = async (invoiceId: string) => {
+  await deductInvoiceStockIfNeeded(invoiceId, "Deducted from invoice (shipped)");
+  await from("invoices").update({ status: "confirmed", updated_at: new Date().toISOString() }).eq("id", invoiceId);
+  await logActivity("confirmed_invoice", "invoice", invoiceId);
+};
+
+// Reserve invoice: allocate stock immediately, not yet paid, not yet shipped.
+export const reserveInvoice = async (invoiceId: string) => {
+  await deductInvoiceStockIfNeeded(invoiceId, "Deducted from invoice (reserved)");
+  await from("invoices").update({ status: "reserved", updated_at: new Date().toISOString() }).eq("id", invoiceId);
+  await logActivity("reserved_invoice", "invoice", invoiceId);
+};
+
+// Convert a Reserved order into an open sales order (legacy "confirmed" = shipped-not-paid bucket
+// in this codebase represents an open, stock-deducted sale awaiting payment). Stock allocation
+// is preserved.
+export const convertReservedToSale = async (invoiceId: string) => {
+  await from("invoices").update({ status: "confirmed", updated_at: new Date().toISOString() }).eq("id", invoiceId);
+  await logActivity("converted_reserved_to_sale", "invoice", invoiceId);
+};
+
+// Mark invoice shipped/picked-up. If already paid -> auto-complete.
+export const shipInvoice = async (invoiceId: string) => {
+  await deductInvoiceStockIfNeeded(invoiceId, "Deducted from invoice (shipped)");
+  const { data: invRow } = await from("invoices").select("status").eq("id", invoiceId).maybeSingle();
+  const wasPaid = (invRow as any)?.status === "paid";
+  await from("invoices").update({
+    status: wasPaid ? "completed" : "shipped",
+    shipped_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).eq("id", invoiceId);
+  await logActivity(wasPaid ? "completed_invoice" : "shipped_invoice", "invoice", invoiceId);
+};
+
+// Cancel a Reserved (or any open) invoice: restore stock if previously deducted.
+export const cancelInvoice = async (invoiceId: string) => {
+  const { data: invRow } = await from("invoices").select("inventory_deducted, branch_id").eq("id", invoiceId).maybeSingle();
+  const wasDeducted = !!(invRow as any)?.inventory_deducted;
+  const branchId: string | null = (invRow as any)?.branch_id ?? null;
+  if (wasDeducted && branchId) {
+    const { data: invItems } = await from("invoice_items").select("*").eq("invoice_id", invoiceId);
+    for (const invItem of (invItems as any[]) || []) {
+      if (!invItem.item_id) continue;
+      await applyStockChange({
+        itemId: invItem.item_id,
+        variationId: invItem.variation_id || null,
+        branchId,
+        qty: -invItem.quantity,
+        referenceId: invoiceId,
+        referenceType: "invoice_cancel",
+        movementType: "in_po",
+        notes: "Restored — invoice cancelled",
+      });
+    }
+  }
+  await from("invoices").update({
+    status: "cancelled",
+    inventory_deducted: false,
+    cancelled_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).eq("id", invoiceId);
+  await removeInvoicePaymentFromLedger(invoiceId);
+  await logActivity("cancelled_invoice", "invoice", invoiceId);
+};
+
+/** Payment methods that never touch a cash or bank account. */
+const NON_LEDGER_PAYMENT_METHODS = ["Credit Card", "Others", "Other"];
+
+/**
+ * Resolves a payment method label to a cash account: "Cash" means the petty cash
+ * account, any other label is matched against bank account names (GCash, BDO, ...).
+ * Returns null for Credit Card / Others, or when no account matches.
+ */
+const resolvePaymentAccount = async (paymentMethod: string) => {
+  if (NON_LEDGER_PAYMENT_METHODS.includes(paymentMethod)) return null;
+  // Via the options function, not a direct select: staff cannot read bank accounts
+  // but must still be able to post an invoice payment into one.
+  const { data } = await _sb.rpc("cash_account_options");
+  const accounts = (data as any[]) || [];
+
+  if (paymentMethod === "Cash") {
+    return accounts.find((a) => a.account_type === "petty_cash") || null;
+  }
+  // Trimmed, so a stray space in an account name is not an orphaned payment.
+  const wanted = (paymentMethod || "").trim().toLowerCase();
+  return accounts.find((a) => (a.name || "").trim().toLowerCase() === wanted) || null;
+};
+
+/**
+ * Posts the invoice total as an inflow to the account matching the payment method.
+ * Silently does nothing for Credit Card / Others or unmatched labels. The unique
+ * index on source_invoice_id makes a repeated mark-as-paid a no-op rather than a
+ * double-post.
+ */
+/** `account` is resolved by the caller, so the label is read once, at payment. */
+const postInvoicePaymentToLedger = async (invoiceId: string, account: { id: string } | null) => {
+  const actor = await currentActor();
+
+  const { data: inv } = await from("invoices")
+    .select("total_amount, invoice_date, invoice_number, customers(name)")
+    .eq("id", invoiceId)
+    .maybeSingle();
+  const amount = Number((inv as any)?.total_amount || 0);
+
+  const { data: existing } = await from("cash_transactions")
+    .select("id").eq("source_invoice_id", invoiceId).maybeSingle();
+
+  // Nothing belongs in the ledger for this invoice — Credit Card, Others, a
+  // payment method matching no account, or a zero total. Clear anything a
+  // previous payment method left behind rather than stranding it.
+  if (!account || amount <= 0) {
+    if (existing) await removeInvoicePaymentFromLedger(invoiceId);
+    return;
+  }
+
+  const entry = {
+    account_id: account.id,
+    direction: "in",
+    amount,
+    category: "Invoice Payment",
+    payee: (inv as any)?.customers?.name || "",
+    reference: (inv as any)?.invoice_number || "",
+    notes: `Auto-posted from invoice ${(inv as any)?.invoice_number || invoiceId}`,
+  };
+
+  // Already posted: move it rather than skipping it. An invoice edited after
+  // payment — a different customer, amount, or payment method — used to leave
+  // the money in the original account under the original customer's name,
+  // because the repeat insert looked like a harmless duplicate.
+  if (existing) {
+    // txn_date is deliberately absent: the posting keeps the date the money
+    // actually moved. Correcting a customer or an amount afterwards should not
+    // shuffle the payment to whenever the correction was made.
+    const { error } = await from("cash_transactions")
+      .update({ ...entry, updated_at: new Date().toISOString(), updated_by: actor.id, updated_by_email: actor.email })
+      .eq("id", (existing as any).id);
+    if (error) throw error;
+    return;
+  }
+
+  const { error } = await from("cash_transactions").insert({
+    ...entry,
+    // The day the invoice was marked paid, not the day it was raised. An
+    // invoice written on the 3rd and settled on the 31st put the money into the
+    // bank on the 3rd, so the balance was wrong for four weeks and the ledger
+    // disagreed with the statement.
+    txn_date: new Date().toISOString().slice(0, 10),
+    source_invoice_id: invoiceId,
+    created_by: actor.id,
+    created_by_email: actor.email,
+  });
+  if (error) throw error;
+};
+
+/** Removes the auto-posted ledger entry for an invoice, if one exists. */
+const removeInvoicePaymentFromLedger = async (invoiceId: string) => {
+  const { error } = await from("cash_transactions").delete().eq("source_invoice_id", invoiceId);
+  if (error) throw error;
+  // RLS filters a DELETE rather than refusing it: a row the caller may not
+  // delete is simply not deleted, and no error is raised. Recalling an invoice
+  // looked like it worked while the payment stayed in the account.
+  const { data: left } = await from("cash_transactions")
+    .select("id").eq("source_invoice_id", invoiceId).maybeSingle();
+  if (left) throw new Error("The invoice's ledger entry could not be removed — it is still in the account.");
+};
+
+// Mark invoice as paid - also deducts stock if not yet deducted (handles draft → paid path).
+// If invoice was already shipped -> auto-complete instead of "paid".
+export const markInvoicePaid = async (
+  invoiceId: string,
+  payment: { payment_method: string; payment_reference?: string | null; payment_reference_url?: string | null },
+) => {
+  await deductInvoiceStockIfNeeded(invoiceId, "Deducted from invoice (paid)");
+  const { data: invRow } = await from("invoices").select("status").eq("id", invoiceId).maybeSingle();
+  const wasShipped = (invRow as any)?.status === "shipped";
+
+  // Resolved once, here, and recorded on the invoice. Renaming the account
+  // afterwards cannot orphan the payment, because nothing re-reads the label.
+  const account = await resolvePaymentAccount(payment.payment_method);
+
+  await from("invoices").update({
+    status: wasShipped ? "completed" : "paid",
+    payment_method: payment.payment_method,
+    payment_account_id: account?.id ?? null,
+    payment_reference: payment.payment_reference || null,
+    payment_reference_url: payment.payment_reference_url || null,
+    updated_at: new Date().toISOString(),
+  }).eq("id", invoiceId);
+  // Never let a ledger problem block the invoice itself from being marked paid —
+  // but never hide one either. The caller surfaces this, because a payment that
+  // silently failed to post is exactly how money goes missing from an account.
+  let ledgerWarning: string | undefined;
+  try {
+    await postInvoicePaymentToLedger(invoiceId, account);
+  } catch (e: any) {
+    ledgerWarning = e?.message || "The payment could not be posted to the cash ledger.";
+    console.warn("Invoice paid, but posting to the cash ledger failed:", e);
+  }
+  // Genuinely fire-and-forget: not awaited, so the user is never left waiting on
+  // an edge-function cold start and a round trip to Telegram. Sent after the
+  // ledger post so the balance in the message is the updated one.
+  notify("notify-payment", { invoice_id: invoiceId });
+  await logActivity(wasShipped ? "completed_invoice" : "marked_invoice_paid", "invoice", invoiceId);
+  return { ledgerWarning };
+};
+
+// Revert invoice to draft - restore stock only if it was previously deducted
+export const revertInvoice = async (invoiceId: string) => {
+  const { data: invRow } = await from("invoices").select("inventory_deducted, branch_id").eq("id", invoiceId).maybeSingle();
+  const wasDeducted = !!(invRow as any)?.inventory_deducted;
+  const branchId: string | null = (invRow as any)?.branch_id ?? null;
+
+  if (wasDeducted && branchId) {
+    const { data: invItems } = await from("invoice_items").select("*").eq("invoice_id", invoiceId);
+    if (invItems) {
+      for (const invItem of invItems as any[]) {
+        if (!invItem.item_id) continue;
+        await applyStockChange({
+          itemId: invItem.item_id,
+          variationId: invItem.variation_id || null,
+          branchId,
+          qty: -invItem.quantity,
+          referenceId: invoiceId,
+          referenceType: "invoice_revert",
+          movementType: "in_po",
+          notes: "Reverted from invoice — stock restored",
+        });
+      }
+    }
+  }
+
+  await from("invoices").update({
+    status: "draft",
+    inventory_deducted: false,
+    shipped_at: null,
+    cancelled_at: null,
+    updated_at: new Date().toISOString(),
+  }).eq("id", invoiceId);
+  await removeInvoicePaymentFromLedger(invoiceId);
+  await logActivity("reverted_invoice", "invoice", invoiceId);
+};
+
+
+// Inventory Movements
+export const getInventoryMovements = async (itemId?: string): Promise<InventoryMovement[]> =>
+  fetchAllRows<InventoryMovement>(() => {
+    let query = from("inventory_movements")
+      .select("*, items(*)")
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
+    if (itemId) query = query.eq("item_id", itemId);
+    return query;
+  });
+
+// Dashboard stats
+export const getDashboardStats = async (branchId?: string | null) => {
+  // Archived items are excluded, as getItems does. Counting them here made
+  // Inventory Value disagree with the Inventory page about the same stock.
+  const { data: items } = await from("items").select("*").neq("status", "archived");
+
+  // Branch-scoped stock: item_branch_stock is the single source of truth.
+  // Paged, because this table holds one row per item per branch — a few hundred
+  // items across three branches already passes the 1000-row cap, and the
+  // shortfall would show up as a quietly smaller Inventory Value.
+  const branchStock = await fetchAllRows<{ item_id: string; quantity: number; branch_id: string }>(() => {
+    let stockQ = from("item_branch_stock")
+      .select("item_id, quantity, branch_id")
+      .order("id", { ascending: true });
+    if (branchId) stockQ = stockQ.eq("branch_id", branchId);
+    return stockQ;
+  });
+  const qtyByItem: Record<string, number> = {};
+  for (const r of (branchStock as any[]) || []) {
+    qtyByItem[r.item_id] = (qtyByItem[r.item_id] || 0) + Number(r.quantity || 0);
+  }
+
+  let recentPOQ = from("purchase_orders").select("*, suppliers(*)").order("created_at", { ascending: false }).limit(5);
+  if (branchId) recentPOQ = recentPOQ.eq("branch_id", branchId);
+  const { data: recentPOs } = await recentPOQ;
+  let recentInvQ = from("invoices").select("*, customers(*)").order("created_at", { ascending: false }).limit(5);
+  if (branchId) recentInvQ = recentInvQ.eq("branch_id", branchId);
+  const { data: recentInvoices } = await recentInvQ;
+
+  // Outstanding (not fully received) line items from local + overseas POs.
+  // Paged: truncation here would understate what is owed to suppliers, which
+  // reads as more cash available for purchasing than there really is.
+  const openPOItems = await fetchAllRows<any>(() => {
+    let openPOQ = from("purchase_order_items")
+      .select("item_id, quantity, received_quantity, unit_cost, purchase_orders!inner(po_number, status, branch_id)")
+      .neq("purchase_orders.status", "received")
+      .order("id", { ascending: true });
+    if (branchId) openPOQ = openPOQ.eq("purchase_orders.branch_id", branchId);
+    return openPOQ;
+  });
+  const openOverseasItems = await fetchAllRows<any>(() => {
+    let openOverseasQ = from("overseas_purchase_order_items")
+      .select("item_id, quantity, received_quantity, unit_cost, overseas_purchase_orders!inner(po_number, status, exchange_rate, branch_id)")
+      .neq("overseas_purchase_orders.status", "received")
+      .order("id", { ascending: true });
+    if (branchId) openOverseasQ = openOverseasQ.eq("overseas_purchase_orders.branch_id", branchId);
+    return openOverseasQ;
+  });
+
+
+  const onOrder: Record<string, { localQty: number; overseasQty: number; localPOs: string[]; overseasPOs: string[] }> = {};
+  let incomingAssetsValue = 0;   // Goods already shipped (in transit), local + overseas
+  let payableAssetsValue = 0;    // Unpaid POs (unpaid / shipped / not yet shipped), local + overseas
+
+  // Statuses that mean "shipped / in transit" (incoming assets)
+  const LOCAL_SHIPPED = new Set<string>([]);
+  const OVERSEAS_SHIPPED = new Set(["shipped"]);
+  // Statuses that mean "not yet paid"
+  const OVERSEAS_UNPAID = new Set(["unpaid", "draft", "sent", "shipped_not_paid"]);
+
+  // Local POs: paid on receipt, so every open PO is a payable; shipped ones are also incoming assets
+  for (const li of (openPOItems as any[]) || []) {
+    const remaining = (li.quantity || 0) - (li.received_quantity || 0);
+    if (remaining <= 0) continue;
+    const status = li.purchase_orders?.status;
+    const value = remaining * Number(li.unit_cost || 0);
+    payableAssetsValue += value;
+    if (LOCAL_SHIPPED.has(status)) incomingAssetsValue += value;
+    if (!li.item_id) continue;
+    const e = onOrder[li.item_id] ||= { localQty: 0, overseasQty: 0, localPOs: [], overseasPOs: [] };
+    e.localQty += remaining;
+    const num = li.purchase_orders?.po_number;
+    if (num && !e.localPOs.includes(num)) e.localPOs.push(num);
+  }
+  // Overseas POs
+  for (const li of (openOverseasItems as any[]) || []) {
+    const remaining = (li.quantity || 0) - (li.received_quantity || 0);
+    if (remaining <= 0) continue;
+    const rate = Number(li.overseas_purchase_orders?.exchange_rate || 1);
+    const status = li.overseas_purchase_orders?.status;
+    const value = remaining * Number(li.unit_cost || 0) * rate;
+    if (OVERSEAS_SHIPPED.has(status)) incomingAssetsValue += value;
+    if (OVERSEAS_UNPAID.has(status)) payableAssetsValue += value;
+    if (!li.item_id) continue;
+    const e = onOrder[li.item_id] ||= { localQty: 0, overseasQty: 0, localPOs: [], overseasPOs: [] };
+    e.overseasQty += remaining;
+    const num = li.overseas_purchase_orders?.po_number;
+    if (num && !e.overseasPOs.includes(num)) e.overseasPOs.push(num);
+  }
+
+  // Accounts Payable = everything we still owe suppliers
+  const accountsPayableValue = payableAssetsValue;
+  // Legacy combined "incoming stock" used by charts
+  const incomingStockValue = incomingAssetsValue;
+
+
+  const itemsList = ((items as any[]) || []).map((i: any) => ({ ...i, quantity: qtyByItem[i.id] ?? 0 }));
+  const totalValue = itemsList.reduce((sum: number, i: any) => sum + (i.quantity * i.cost_price), 0);
+
+  // Reserving an invoice takes the stock out of item_branch_stock, so it has
+  // already left totalValue above. It is still ours until the sale completes,
+  // so it is carried at cost — server-side, because invoice_items across all
+  // reserved invoices can exceed PostgREST's 1000-row cap and a client-side sum
+  // would silently return part of it.
+  const { data: reservedValue, error: reservedError } = await supabase.rpc("reserved_stock_value", {
+    p_branch_id: branchId ?? null,
+  });
+  // Deliberately not fatal — the rest of the dashboard is still worth showing —
+  // but not silent either: falling back to zero quietly would drop a real asset
+  // out of Net Asset Value with nothing to say it had happened.
+  if (reservedError) {
+    console.error("reserved_stock_value failed; Net Asset Value is short by the reserved stock", reservedError);
+  }
+  const reservedStockValue = Number(reservedValue || 0);
+  const lowStockItems = itemsList
+    .filter((i: any) => (i.low_stock_threshold ?? 0) > 0 && i.quantity <= i.low_stock_threshold)
+    .map((i: any) => ({ ...i, on_order: onOrder[i.id] || { localQty: 0, overseasQty: 0, localPOs: [], overseasPOs: [] } }));
+
+  // ---- Period sales, gross profit, receivables, open PO count ----
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const iso = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const todayIso = iso(now);
+  const monthStartIso = iso(new Date(now.getFullYear(), now.getMonth(), 1));
+
+  // A sale counts once the customer has paid — the same rule getSalesTrend uses,
+  // so the cards and the trend chart on this page cannot disagree. Counting
+  // `confirmed`, `shipped` (both shipped-not-paid) and `reserved` (allocated
+  // stock on an unpaid order) booked revenue that had not been earned.
+  const SOLD_INVOICE_STATUSES = ["paid", "completed"];
+
+  const periodSales = async (fromIso: string) => {
+    let invQ = from("invoices")
+      .select("total_amount")
+      .in("status", SOLD_INVOICE_STATUSES)
+      .gte("invoice_date", fromIso)
+      .lte("invoice_date", todayIso);
+    if (branchId) invQ = invQ.eq("branch_id", branchId);
+    let onQ = from("online_sales")
+      .select("posted_price, quantity")
+      .eq("status", "completed")
+      .gte("order_date", fromIso)
+      .lte("order_date", todayIso);
+    if (branchId) onQ = onQ.eq("branch_id", branchId);
+    const [{ data: inv }, { data: on }] = await Promise.all([invQ, onQ]);
+    const invTotal = ((inv as any[]) || []).reduce((s, r) => s + Number(r.total_amount || 0), 0);
+    const onTotal = ((on as any[]) || []).reduce((s, r) => s + Number(r.posted_price || 0) * (r.quantity || 1), 0);
+    return invTotal + onTotal;
+  };
+
+  const [salesToday, salesThisMonth, receivablesValue] = await Promise.all([
+    periodSales(todayIso),
+    periodSales(monthStartIso),
+    getAccountsReceivable(branchId),
+  ]);
+
+  // Gross profit for the current month (invoice line financials). Paged: a busy
+  // month can run past 1000 invoice lines, and the truncation would read as a
+  // plausibly smaller profit rather than an error.
+  const gpRows = await fetchAllRows<{ line_profit: number | null }>(() => {
+    let gpQ = from("invoice_item_financials")
+      .select("line_profit, invoices!inner(invoice_date, status, branch_id)")
+      .gte("invoices.invoice_date", monthStartIso)
+      .lte("invoices.invoice_date", todayIso)
+      // Same basis as salesThisMonth above: profit on an unpaid order is not
+      // earned either, and mixing the two makes the margin look impossible.
+      .in("invoices.status", SOLD_INVOICE_STATUSES)
+      .order("id", { ascending: true });
+    if (branchId) gpQ = gpQ.eq("invoices.branch_id", branchId);
+    return gpQ;
+  });
+  const grossProfitMonth = gpRows.reduce((s, r) => s + Number(r.line_profit || 0), 0);
+
+  // Open purchase orders (local + overseas) count
+  let poCountQ = from("purchase_orders").select("id", { count: "exact", head: true }).neq("status", "received");
+  if (branchId) poCountQ = poCountQ.eq("branch_id", branchId);
+  let opoCountQ = from("overseas_purchase_orders").select("id", { count: "exact", head: true }).neq("status", "received");
+  if (branchId) opoCountQ = opoCountQ.eq("branch_id", branchId);
+  const [{ count: poCount }, { count: opoCount }] = await Promise.all([poCountQ, opoCountQ]);
+  const openPurchaseOrders = (poCount || 0) + (opoCount || 0);
+
+  return {
+    totalItems: itemsList.length,
+    totalValue,
+    reservedStockValue,
+    incomingStockValue,
+    incomingAssetsValue,
+    payableAssetsValue,
+    accountsPayableValue,
+    totalAssetValue: totalValue + incomingAssetsValue,
+    salesToday,
+    salesThisMonth,
+    grossProfitMonth,
+    receivablesValue,
+    openPurchaseOrders,
+    lowStockItems: lowStockItems as (Item & { on_order: { localQty: number; overseasQty: number; localPOs: string[]; overseasPOs: string[] } })[],
+    recentPOs: (recentPOs || []) as PurchaseOrder[],
+    recentInvoices: (recentInvoices || []) as Invoice[],
+  };
+};
+
+
+
+// Document sequences
+export const getDocumentSequences = async () => {
+  const { data, error } = await from("document_sequences").select("*");
+  if (error) throw error;
+  return data as { id: string; prefix: string; next_number: number; padding: number }[];
+};
+
+export const updateDocumentSequence = async (id: string, updates: { prefix?: string; next_number?: number }) => {
+  const { error } = await from("document_sequences").update(updates).eq("id", id);
+  if (error) throw error;
+};
+
+const generateNextNumber = async (seqId: string): Promise<string> => {
+  const { data, error } = await from("document_sequences").select("*").eq("id", seqId).single();
+  if (error) throw error;
+  const seq = data as { prefix: string; next_number: number; padding: number };
+  const num = String(seq.next_number).padStart(seq.padding, "0");
+  await from("document_sequences").update({ next_number: seq.next_number + 1 }).eq("id", seqId);
+  return `${seq.prefix}-${num}`;
+};
+
+export const generatePONumber = () => generateNextNumber("purchase_order");
+export const generateQuotationNumber = () => generateNextNumber("quotation");
+export const generateInvoiceNumber = () => generateNextNumber("invoice");
+export const generateOverseasPONumber = () => generateNextNumber("overseas_purchase_order");
+export const generateShopeeOrderNumber = () => generateNextNumber("shopee_order");
+export const generateLazadaOrderNumber = () => generateNextNumber("lazada_order");
+
+// Online Sales
+export const getOnlineSales = async (branchId?: string | null): Promise<OnlineSale[]> =>
+  fetchAllRows<OnlineSale>(() => {
+    let q = from("online_sales")
+      .select("*, items(*), item_variations(*)")
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
+    if (branchId) q = q.eq("branch_id", branchId);
+    return q;
+  });
+
+export const createOnlineSale = async (sale: Partial<OnlineSale>) => {
+  const { data, error } = await from("online_sales").insert(sale).select().single();
+  if (error) throw error;
+  const created = data as OnlineSale;
+
+  // Deduct inventory if linked to an item (variation-aware)
+  if (created.item_id) {
+    const branchId: string | null = (created as any).branch_id ?? null;
+    if (!branchId) throw new Error("Online sale is missing a branch. Select a branch before saving.");
+    await applyStockChange({
+      itemId: created.item_id,
+      variationId: (created as any).variation_id || null,
+      branchId,
+      qty: created.quantity || 1,
+      referenceId: created.id,
+      referenceType: "online_sale",
+      movementType: "out_online_sale",
+      notes: `Sold via ${created.sales_channel} - ${created.order_number}`,
+    });
+  }
+  await logActivity("created_online_sale", "online_sale", created.id, { order_number: created.order_number, channel: created.sales_channel });
+  return created;
+};
+
+export const updateOnlineSale = async (id: string, sale: Partial<OnlineSale>) => {
+  const { data, error } = await from("online_sales").update({ ...sale, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  return data as OnlineSale;
+};
+
+export const returnOnlineSale = async (id: string, status: 'returned' | 'cancelled') => {
+  const { data: sale } = await from("online_sales").select("item_id, variation_id, branch_id, order_number, sales_channel, quantity, status").eq("id", id).single();
+  if (!sale) throw new Error("Sale not found");
+  const s = sale as any;
+  if (s.status === 'returned' || s.status === 'cancelled') throw new Error("Sale already returned/cancelled");
+
+  // Restore inventory if linked to an item (variation-aware)
+  if (s.item_id && s.branch_id) {
+    await applyStockChange({
+      itemId: s.item_id,
+      variationId: s.variation_id || null,
+      branchId: s.branch_id,
+      qty: -(s.quantity || 1),
+      referenceId: id,
+      referenceType: `online_sale_${status}`,
+      movementType: "in_po",
+      notes: `${status === 'returned' ? 'Returned' : 'Cancelled'} order ${s.order_number} — inventory restored`,
+    });
+  }
+
+  const { data, error } = await from("online_sales").update({ status, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  await logActivity(`${status}_online_sale`, "online_sale", id, { order_number: s.order_number });
+  return data as OnlineSale;
+};
+
+export const deleteOnlineSale = async (id: string) => {
+  // Note: deleting an online sale does NOT restore inventory.
+  // Use the Return action if stock needs to be replenished.
+  const { error } = await from("online_sales").delete().eq("id", id);
+  if (error) throw error;
+};
+
+// Overseas Purchase Orders
+export const getOverseasPurchaseOrders = async (): Promise<OverseasPurchaseOrder[]> => {
+  const { data, error } = await from("overseas_purchase_orders").select("*, overseas_suppliers(*)").order("created_at", { ascending: false });
+  if (error) throw error;
+  return data;
+};
+
+export const createOverseasPurchaseOrder = async (po: Partial<OverseasPurchaseOrder>) => {
+  const { data, error } = await from("overseas_purchase_orders").insert(po).select().single();
+  if (error) throw error;
+  return data as OverseasPurchaseOrder;
+};
+
+export const updateOverseasPurchaseOrder = async (id: string, po: Partial<OverseasPurchaseOrder>) => {
+  // Detect a status transition into a "shipped" state so we can auto-create a shipment.
+  const shippedStatuses = new Set(["shipped", "shipped_not_paid", "sent"]);
+  let prevStatus: string | null = null;
+  if (po.status && shippedStatuses.has(po.status as string)) {
+    const { data: prev } = await from("overseas_purchase_orders").select("status").eq("id", id).single();
+    prevStatus = (prev as any)?.status ?? null;
+  }
+
+  const { data, error } = await from("overseas_purchase_orders").update({ ...po, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+
+  const updatedPo = data as OverseasPurchaseOrder;
+
+  // When a PO transitions into a shipped state for the first time, ensure a shipment row exists.
+  const becameShipped = po.status && shippedStatuses.has(po.status as string) && !shippedStatuses.has(prevStatus || "");
+  if (becameShipped) {
+    const { data: existing } = await from("shipment_tracking").select("id").eq("po_id", id).limit(1);
+    if (!existing || (existing as any[]).length === 0) {
+      await from("shipment_tracking").insert({
+        po_id: id,
+        status: "in_transit",
+        ship_date: new Date().toISOString().slice(0, 10),
+        estimated_arrival: (updatedPo as any).expected_delivery || null,
+        notes: "Auto-created when PO marked as shipped",
+      });
+      await logActivity("created_shipment_tracking", "shipment_tracking", id, { auto: true, po_id: id });
+    }
+  }
+
+  // Keep shipment ETA in sync when the PO's estimated arrival changes.
+  if (Object.prototype.hasOwnProperty.call(po, "expected_delivery")) {
+    await from("shipment_tracking")
+      .update({ estimated_arrival: (po as any).expected_delivery || null, updated_at: new Date().toISOString() })
+      .eq("po_id", id);
+  }
+
+  return updatedPo;
+};
+
+export const deleteOverseasPurchaseOrder = async (id: string) => {
+  const { error } = await from("overseas_purchase_orders").delete().eq("id", id);
+  if (error) throw error;
+};
+
+export const getOverseasPOItems = async (poId: string): Promise<OverseasPurchaseOrderItem[]> => {
+  const { data, error } = await from("overseas_purchase_order_items").select("*, items(*)").eq("po_id", poId);
+  if (error) throw error;
+  return data;
+};
+
+export const getAllOverseasPOItems = async (): Promise<OverseasPurchaseOrderItem[]> => {
+  const { data, error } = await from("overseas_purchase_order_items").select("*");
+  if (error) throw error;
+  return data as any;
+};
+
+export const createOverseasPOItems = async (items: Partial<OverseasPurchaseOrderItem>[]) => {
+  const { error } = await from("overseas_purchase_order_items").insert(items);
+  if (error) throw error;
+};
+
+export const deleteOverseasPOItems = async (poId: string) => {
+  const { error } = await from("overseas_purchase_order_items").delete().eq("po_id", poId);
+  if (error) throw error;
+};
+
+// Receive an Overseas PO partially: only the line items + quantities specified are added to stock.
+// itemsToReceive: list of { poItemId, itemId (nullable for custom), quantity }
+// Custom (non-inventory) lines can also be marked received but won't touch stock.
+export const receiveOverseasPO = async (
+  poId: string,
+  itemsToReceive: { poItemId: string; itemId: string | null; quantity: number; location?: "warehouse" | "store" }[],
+  receivedDate?: string,
+  branchOverride?: string | null,
+) => {
+  const rcvDate = receivedDate || new Date().toISOString().split("T")[0];
+  const { data: poRow } = await from("overseas_purchase_orders").select("branch_id, status").eq("id", poId).single();
+  const originalBranchId: string | null = (poRow as any)?.branch_id ?? null;
+  const poBranchId: string | null = branchOverride ?? originalBranchId;
+  if (!poBranchId) throw new Error("This PO has no branch assigned. Edit the PO and set its branch before receiving.");
+
+  if (branchOverride && branchOverride !== originalBranchId) {
+    await from("overseas_purchase_orders").update({ branch_id: branchOverride, updated_at: new Date().toISOString() }).eq("id", poId);
+    await logActivity("changed_overseas_po_branch", "overseas_purchase_order", poId, { from: originalBranchId, to: branchOverride });
+  }
+
+  for (const item of itemsToReceive) {
+    if (item.quantity <= 0) continue;
+
+    const { data: poItem } = await from("overseas_purchase_order_items")
+      .select("received_quantity, quantity")
+      .eq("id", item.poItemId)
+      .single();
+    const prevReceived = ((poItem as any)?.received_quantity || 0);
+    const ordered = ((poItem as any)?.quantity || 0);
+    const newReceived = Math.min(prevReceived + item.quantity, ordered);
+    await from("overseas_purchase_order_items")
+      .update({ received_quantity: newReceived, received_date: rcvDate })
+      .eq("id", item.poItemId);
+
+    if (item.itemId) {
+      const location = item.location || "warehouse";
+      const result = await applyBranchStockRpc({
+        itemId: item.itemId,
+        branchId: poBranchId,
+        location,
+        deltaStock: item.quantity,
+      });
+      const before = location === "store" ? result.st_before : result.wh_before;
+      const after = location === "store" ? result.store_quantity : result.warehouse_quantity;
+
+      await recordMovement({
+        itemId: item.itemId,
+        branchId: poBranchId,
+        type: "in_po",
+        quantity: item.quantity,
+        unit: "pcs",
+        location,
+        referenceId: poId,
+        referenceType: "overseas_purchase_order",
+        notes: `Received from overseas PO on ${rcvDate} → ${location}`,
+        balanceBefore: before,
+        balanceAfter: after,
+      });
+    }
+  }
+
+  const { data: allItems } = await from("overseas_purchase_order_items")
+    .select("quantity, received_quantity")
+    .eq("po_id", poId);
+  const list = (allItems as any[]) || [];
+  const allReceived = list.length > 0 && list.every((i) => (i.received_quantity || 0) >= i.quantity);
+  const someReceived = list.some((i) => (i.received_quantity || 0) > 0);
+
+  const prevStatus = (poRow as any)?.status || "unpaid";
+  const preserved = prevStatus === "received";
+  const newStatus = preserved
+    ? prevStatus
+    : allReceived
+      ? "received"
+      : someReceived
+        ? "partially_received"
+        : (prevStatus === "partially_received" ? "shipped" : prevStatus);
+
+  await from("overseas_purchase_orders")
+    .update({ status: newStatus, updated_at: new Date().toISOString() })
+    .eq("id", poId);
+
+  if (allReceived) {
+    await from("shipment_tracking")
+      .update({ status: "delivered", actual_arrival: rcvDate, updated_at: new Date().toISOString() })
+      .eq("po_id", poId);
+  }
+
+  await logActivity("received_overseas_purchase_order", "overseas_purchase_order", poId, { status: newStatus, received_date: rcvDate });
+};
+
+// Undo Receive for Overseas PO — reverses received quantities per line item and deducts inventory.
+// Throws if the reversal would exceed current on-hand inventory.
+export const unreceiveOverseasPO = async (
+  poId: string,
+  itemsToUnreceive: { poItemId: string; itemId: string | null; quantity: number }[],
+) => {
+  const { data: poRow } = await from("overseas_purchase_orders").select("branch_id").eq("id", poId).single();
+  const poBranchId: string | null = (poRow as any)?.branch_id ?? null;
+
+  for (const item of itemsToUnreceive) {
+    if (item.quantity <= 0) continue;
+    const { data: poItem } = await from("overseas_purchase_order_items")
+      .select("received_quantity")
+      .eq("id", item.poItemId)
+      .single();
+    const currentReceived = Number((poItem as any)?.received_quantity || 0);
+    const undoQty = Math.min(item.quantity, currentReceived);
+    if (undoQty <= 0) continue;
+
+    if (item.itemId && poBranchId) {
+      // Read current branch stock
+      const { data: ibs } = await from("item_branch_stock")
+        .select("warehouse_quantity, store_quantity")
+        .eq("item_id", item.itemId)
+        .eq("branch_id", poBranchId)
+        .maybeSingle();
+      const curWh = Number((ibs as any)?.warehouse_quantity || 0);
+      const curSt = Number((ibs as any)?.store_quantity || 0);
+      const onHand = curWh + curSt;
+      if (onHand < undoQty) {
+        const { data: nm } = await from("items").select("name").eq("id", item.itemId).single();
+        throw new Error(
+          `Cannot undo this receipt for "${(nm as any)?.name || "item"}" at this branch (on hand: ${onHand}, needed: ${undoQty}). Please perform a manual inventory adjustment instead.`,
+        );
+      }
+      const fromWh = Math.min(curWh, undoQty);
+      const fromSt = undoQty - fromWh;
+
+      if (fromWh > 0) {
+        const r = await applyBranchStockRpc({
+          itemId: item.itemId,
+          branchId: poBranchId,
+          location: "warehouse",
+          deltaStock: -fromWh,
+        });
+        await recordMovement({
+          itemId: item.itemId,
+          branchId: poBranchId,
+          type: "in_po",
+          quantity: fromWh,
+          unit: "pcs",
+          location: "warehouse",
+          referenceId: poId,
+          referenceType: "overseas_purchase_order_undo",
+          notes: `Undo receive from overseas PO`,
+          balanceBefore: r.wh_before,
+          balanceAfter: r.warehouse_quantity,
+        });
+      }
+      if (fromSt > 0) {
+        const r = await applyBranchStockRpc({
+          itemId: item.itemId,
+          branchId: poBranchId,
+          location: "store",
+          deltaStock: -fromSt,
+        });
+        await recordMovement({
+          itemId: item.itemId,
+          branchId: poBranchId,
+          type: "in_po",
+          quantity: fromSt,
+          unit: "pcs",
+          location: "store",
+          referenceId: poId,
+          referenceType: "overseas_purchase_order_undo",
+          notes: `Undo receive from overseas PO`,
+          balanceBefore: r.st_before,
+          balanceAfter: r.store_quantity,
+        });
+      }
+    }
+
+    const newReceived = currentReceived - undoQty;
+    await from("overseas_purchase_order_items")
+      .update({ received_quantity: newReceived, received_date: newReceived === 0 ? null : undefined })
+      .eq("id", item.poItemId);
+  }
+
+  const { data: allItems } = await from("overseas_purchase_order_items")
+    .select("quantity, received_quantity")
+    .eq("po_id", poId);
+  const list = (allItems as any[]) || [];
+  const allReceived = list.length > 0 && list.every((i) => (i.received_quantity || 0) >= i.quantity);
+  const someReceived = list.some((i) => (i.received_quantity || 0) > 0);
+  const newStatus = allReceived ? "received" : someReceived ? "partially_received" : "shipped";
+  await from("overseas_purchase_orders")
+    .update({ status: newStatus, updated_at: new Date().toISOString() })
+    .eq("id", poId);
+  await logActivity("undo_receive_overseas_purchase_order", "overseas_purchase_order", poId, { status: newStatus });
+};
+
+// Shipment Tracking
+export const getShipments = async (): Promise<ShipmentTracking[]> => {
+  const { data, error } = await from("shipment_tracking").select("*, overseas_purchase_orders(*, overseas_suppliers(*))").order("created_at", { ascending: false });
+  if (error) throw error;
+  return data;
+};
+
+export const createShipment = async (s: Partial<ShipmentTracking>) => {
+  const { data, error } = await from("shipment_tracking").insert(s).select().single();
+  if (error) throw error;
+  return data as ShipmentTracking;
+};
+
+export const updateShipment = async (id: string, s: Partial<ShipmentTracking>) => {
+  const { data, error } = await from("shipment_tracking").update({ ...s, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  return data as ShipmentTracking;
+};
+
+export const deleteShipment = async (id: string) => {
+  const { error } = await from("shipment_tracking").delete().eq("id", id);
+  if (error) throw error;
+};
+
+// Sales Agents
+export const getSalesAgents = async (): Promise<{ id: string; name: string }[]> => {
+  const { data, error } = await from("sales_agents").select("*").order("name");
+  if (error) throw error;
+  return data;
+};
+
+export const createSalesAgent = async (name: string) => {
+  const { data, error } = await from("sales_agents").insert({ name }).select().single();
+  if (error) throw error;
+  return data;
+};
+
+/** Returns last sales agent + last order date for each given customer. */
+export const getCustomerSalesActivity = async (
+  customerIds: string[],
+): Promise<Record<string, { lastAgent: string | null; lastDate: string | null }>> => {
+  const out: Record<string, { lastAgent: string | null; lastDate: string | null }> = {};
+  if (!customerIds.length) return out;
+  const apply = (cid: string, agent: string | null, date: string | null) => {
+    const cur = out[cid];
+    if (!cur || (date && (!cur.lastDate || date > cur.lastDate))) {
+      out[cid] = { lastAgent: agent || cur?.lastAgent || null, lastDate: date || cur?.lastDate || null };
+    }
+  };
+  const { data: invs } = await from("invoices")
+    .select("customer_id, sales_agent, invoice_date")
+    .in("customer_id", customerIds)
+    .in("status", ["confirmed", "paid", "unpaid"])
+    .order("invoice_date", { ascending: false });
+  for (const r of (invs as any[]) || []) if (r.customer_id) apply(r.customer_id, r.sales_agent || null, r.invoice_date || null);
+  const { data: quotes } = await from("quotations")
+    .select("customer_id, sales_agent, quotation_date")
+    .in("customer_id", customerIds)
+    .order("quotation_date", { ascending: false });
+  for (const r of (quotes as any[]) || []) if (r.customer_id) apply(r.customer_id, r.sales_agent || null, r.quotation_date || null);
+  return out;
+};
+
+/** Returns the most-recently-used sales agent for a single customer. */
+export const getLastSalesAgentForCustomer = async (customerId: string): Promise<string | null> => {
+  if (!customerId) return null;
+  const map = await getCustomerSalesActivity([customerId]);
+  return map[customerId]?.lastAgent || null;
+};
+
+/** Aggregates accounts receivable (unpaid invoices + manual receivables). */
+export const getAccountsReceivable = async (branchId?: string | null): Promise<number> => {
+  // Mirrors the Pending Payments page: open, not-yet-paid invoices.
+  let invQ = from("invoices").select("total_amount, status").in("status", ["confirmed", "unpaid", "shipped"]);
+  if (branchId) invQ = invQ.eq("branch_id", branchId);
+  const { data: invs } = await invQ;
+  const invTotal = ((invs as any[]) || []).reduce((s, r) => s + Number(r.total_amount || 0), 0);
+  // Manual receivables have no branch column — only include when viewing all branches.
+  let mrTotal = 0;
+  if (!branchId) {
+    const { data: mr } = await from("manual_receivables").select("amount, status").neq("status", "paid");
+    mrTotal = ((mr as any[]) || []).reduce((s, r) => s + Number(r.amount || 0), 0);
+  }
+  return invTotal + mrTotal;
+};
+
+/**
+ * Daily sales between two ISO dates, split into invoice and online.
+ *
+ * A sale counts once the customer has paid: invoices in `paid` or `completed`
+ * (completed being shipped-then-paid), regardless of shipping. Online orders count
+ * on their order date whether or not payment has landed, since the order itself is
+ * the sale; only cancelled and returned orders are excluded.
+ */
+export const getSalesTrend = async (
+  fromIso: string,
+  toIso: string,
+  branchId?: string | null,
+): Promise<{ date: string; online: number; invoice: number; total: number }[]> => {
+  let onlineQ = from("online_sales")
+    .select("order_date, posted_price, quantity, branch_id, status")
+    .gte("order_date", fromIso)
+    .lte("order_date", toIso)
+    .not("status", "in", "(cancelled,returned)");
+  if (branchId) onlineQ = onlineQ.eq("branch_id", branchId);
+  const { data: online } = await onlineQ;
+
+  let invQ = from("invoices")
+    .select("invoice_date, total_amount, status, branch_id")
+    .gte("invoice_date", fromIso)
+    .lte("invoice_date", toIso)
+    .in("status", ["paid", "completed"]);
+  if (branchId) invQ = invQ.eq("branch_id", branchId);
+  const { data: invs } = await invQ;
+
+  const map: Record<string, { online: number; invoice: number }> = {};
+  for (const r of (online as any[]) || []) {
+    const k = r.order_date;
+    if (!k) continue;
+    (map[k] ||= { online: 0, invoice: 0 }).online += Number(r.posted_price || 0) * (r.quantity || 1);
+  }
+  for (const r of (invs as any[]) || []) {
+    const k = r.invoice_date;
+    if (!k) continue;
+    (map[k] ||= { online: 0, invoice: 0 }).invoice += Number(r.total_amount || 0);
+  }
+  return Object.entries(map)
+    .map(([date, v]) => ({ date, online: v.online, invoice: v.invoice, total: v.online + v.invoice }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+};
+
+// ==============================
+// Admin-only invoice financials
+// ==============================
+// These reads are gated by RLS on the server — non-admins get an empty
+// array back from Supabase and never see cost or profit values.
+
+export interface InvoiceItemFinancial {
+  id: string;
+  invoice_id: string;
+  item_id: string;
+  variation_id: string | null;
+  cost_snapshot: number;
+  quantity: number;
+  unit_price: number;
+  line_total_cost: number;
+  line_profit: number;
+}
+
+export interface InvoiceFinancial {
+  id: string;
+  invoice_id: string;
+  total_sales: number;
+  total_cost: number;
+  total_profit: number;
+  profit_margin: number;
+  paid_at: string | null;
+}
+
+export const getInvoiceItemFinancials = async (invoiceId: string): Promise<InvoiceItemFinancial[]> => {
+  const { data, error } = await (supabase as any)
+    .from("invoice_item_financials")
+    .select("*")
+    .eq("invoice_id", invoiceId);
+  if (error) return [];
+  return (data as InvoiceItemFinancial[]) || [];
+};
+
+export const getInvoiceFinancial = async (invoiceId: string): Promise<InvoiceFinancial | null> => {
+  const { data, error } = await (supabase as any)
+    .from("invoice_financials")
+    .select("*")
+    .eq("invoice_id", invoiceId)
+    .maybeSingle();
+  if (error) return null;
+  return (data as InvoiceFinancial) || null;
+};
+
+
+// ---------------------------------------------------------------------------
+// Finance: cash accounts, cash ledger, owner transactions, payables
+// ---------------------------------------------------------------------------
+
+export const getCashAccounts = async (): Promise<CashAccount[]> => {
+  const { data, error } = await from("cash_accounts")
+    .select("*")
+    .order("sort_order", { ascending: true });
+  if (error) throw error;
+  return data;
+};
+
+export const createCashAccount = async (a: Partial<CashAccount>) => {
+  const { data, error } = await from("cash_accounts").insert(a).select().single();
+  if (error) throw error;
+  const created = data as CashAccount;
+  await logActivity("created_cash_account", "cash_account", created.id, { name: created.name });
+  return created;
+};
+
+export const updateCashAccount = async (id: string, a: Partial<CashAccount>) => {
+  const { data, error } = await from("cash_accounts")
+    .update({ ...a, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  const updated = data as CashAccount;
+  await logActivity("updated_cash_account", "cash_account", id, { name: updated.name });
+  return updated;
+};
+
+export const deleteCashAccount = async (id: string) => {
+  const { error } = await from("cash_accounts").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_cash_account", "cash_account", id);
+};
+
+/** Ledger rows, newest first. Pass accountIds to scope to petty cash or banks. */
+export const getCashTransactions = async (accountIds?: string[]): Promise<CashTransaction[]> => {
+  if (accountIds && !accountIds.length) return [];
+  return fetchAllRows<CashTransaction>(() => {
+    let q = from("cash_transactions")
+      // Only the account name is rendered; joining every account column repeated
+      // the whole account row onto each transaction for nothing.
+      .select("*, cash_accounts(name)")
+      .order("txn_date", { ascending: false })
+      .order("created_at", { ascending: false })
+      // Unique tiebreak, so two rows sharing a date and timestamp cannot land on
+      // both sides of a page boundary.
+      .order("id", { ascending: false });
+    if (accountIds) q = q.in("account_id", accountIds);
+    return q;
+  });
+};
+
+/**
+ * Sends a Telegram notification without blocking the caller.
+ *
+ * Deliberately not awaited: waiting on an edge-function cold start plus a round
+ * trip to Telegram added seconds to recording a payment. The trade-off is that a
+ * tab closed within a second of the action may cancel the request and lose that
+ * one message — the record itself is already saved by then. Failures are logged
+ * to the console rather than surfaced, since they must never interrupt the user.
+ */
+const notify = (fn: "notify-payment" | "notify-cash", body: Record<string, unknown>) => {
+  void supabase.functions
+    .invoke(fn, { body })
+    .then(({ error }) => {
+      if (error) console.warn(`${fn} failed:`, error);
+    })
+    .catch((e) => console.warn(`${fn} failed:`, e));
+};
+
+/**
+ * Current user's id and email, for stamping who touched a ledger row.
+ *
+ * Reads the cached session rather than calling `getUser`, which hits the auth
+ * server over the network every time and sat in front of every ledger write.
+ * These columns are only an audit stamp — access is enforced by RLS on the
+ * server, which trusts the JWT rather than anything sent from here.
+ */
+const currentActor = async () => {
+  const { data: { session } } = await supabase.auth.getSession();
+  return { id: session?.user?.id || null, email: session?.user?.email || "" };
+};
+
+export const createCashTransaction = async (t: Partial<CashTransaction>) => {
+  const actor = await currentActor();
+  const { data, error } = await from("cash_transactions")
+    .insert({ ...t, created_by: actor.id, created_by_email: actor.email })
+    .select().single();
+  if (error) throw error;
+  const created = data as CashTransaction;
+  await logActivity("created_cash_transaction", "cash_transaction", created.id, {
+    amount: created.amount, direction: created.direction,
+  });
+  notify("notify-cash", { transaction_id: created.id });
+  return created;
+};
+
+export const updateCashTransaction = async (id: string, t: Partial<CashTransaction>) => {
+  const actor = await currentActor();
+  const { data, error } = await from("cash_transactions")
+    .update({ ...t, updated_at: new Date().toISOString(), updated_by: actor.id, updated_by_email: actor.email })
+    .eq("id", id).select().single();
+  if (error) throw error;
+  await logActivity("updated_cash_transaction", "cash_transaction", id);
+  return data as CashTransaction;
+};
+
+export const deleteCashTransaction = async (id: string) => {
+  const { error } = await from("cash_transactions").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_cash_transaction", "cash_transaction", id);
+};
+
+/** Move money between two accounts as a linked pair of ledger rows. */
+/**
+ * Account id/name/type only — no balances. Lets staff pick a bank as a transfer
+ * destination or invoice payment method without being able to read bank accounts.
+ */
+export const getCashAccountOptions = async (): Promise<
+  Pick<CashAccount, "id" | "name" | "account_type" | "currency">[]
+> => {
+  const { data, error } = await _sb.rpc("cash_account_options");
+  if (error) throw error;
+  return (data as any[]) || [];
+};
+
+/**
+ * Every active branch, names only. Used for a transfer's destination: stock can
+ * be sent to a branch the user does not work at and therefore cannot read.
+ */
+export const getBranchOptions = async (): Promise<
+  { id: string; branch_name: string; branch_code: string }[]
+> => {
+  const { data, error } = await _sb.rpc("branch_options");
+  if (error) throw error;
+  return (data as any[]) || [];
+};
+
+export const createCashTransfer = async (args: {
+  from_account_id: string;
+  to_account_id: string;
+  amount: number;
+  /** Amount landing in the destination when currencies differ; defaults to `amount`. */
+  amount_to?: number;
+  /** PHP per destination unit, recorded so the weighted average can be maintained. */
+  fx_rate?: number | null;
+  txn_date: string;
+  notes?: string;
+}) => {
+  // Written by a SECURITY DEFINER function: the destination may be a bank the
+  // caller is not allowed to read, so the pair cannot be inserted from here.
+  const { data, error } = await _sb.rpc("create_cash_transfer", {
+    p_from_account_id: args.from_account_id,
+    p_to_account_id: args.to_account_id,
+    p_amount: args.amount,
+    p_amount_to: args.amount_to ?? args.amount,
+    p_fx_rate: args.fx_rate ?? null,
+    p_txn_date: args.txn_date,
+    p_notes: args.notes || "",
+  });
+  if (error) throw error;
+  await logActivity("created_cash_transfer", "cash_transaction", String(data || ""), { amount: args.amount });
+  notify("notify-cash", { transfer_group_id: data });
+};
+
+// owner_transactions is no longer read: the owner is a cash account, so paying
+// them is a transfer like any other. The table remains as a backup of the
+// records copied across in 20260825000000_owner_as_cash_account.sql.
+
+export const getPayables = async (): Promise<Payable[]> => {
+  const { data, error } = await from("payables")
+    .select("*, suppliers(*)")
+    .order("due_date", { ascending: true, nullsFirst: false });
+  if (error) throw error;
+  return data;
+};
+
+/**
+ * Keeps the cash/bank side of a payable in step with its status.
+ *
+ * Marking a payable Paid takes the money out of the account it names; anything
+ * else — reverting to unpaid, a bounced check, a cancellation — puts it back.
+ * Deliberately keyed on `paid` alone: `cleared` is about the check reaching the
+ * bank, and posting on both would deduct twice.
+ *
+ * The posting is a normal cash transaction, so it shows in the ledger, the
+ * running balance and the Telegram notification like any other withdrawal.
+ * A unique index on payable_id makes the insert the source of truth about
+ * whether a payable has already been settled.
+ */
+const syncPayablePosting = async (p: Payable) => {
+  const { data: existing } = await from("cash_transactions")
+    .select("id, amount, account_id").eq("payable_id", p.id).maybeSingle();
+
+  const { shouldPost, accountId, amount } = payablePosting(p as any);
+
+  if (!shouldPost) {
+    // Un-paid, bounced or cancelled: the money never left, so take the
+    // withdrawal back out of the ledger.
+    if (existing) await deleteCashTransaction((existing as any).id);
+    return;
+  }
+
+  if (existing) {
+    // Editing a settled payable — a corrected amount, or a different account —
+    // moves the posting with it rather than leaving a stale withdrawal behind.
+    const row = existing as any;
+    if (Number(row.amount) !== amount || row.account_id !== accountId) {
+      await updateCashTransaction(row.id, { amount, account_id: accountId } as Partial<CashTransaction>);
+    }
+    return;
+  }
+
+  await createCashTransaction({
+    account_id: accountId,
+    direction: "out",
+    amount,
+    txn_date: new Date().toISOString().slice(0, 10),
+    category: p.category || "Payable",
+    payee: p.payee,
+    reference: p.is_check ? p.check_number || "" : "",
+    notes: `Payable settled${p.is_check && p.check_number ? ` · check ${p.check_number}` : ""}`,
+    payable_id: p.id,
+  } as Partial<CashTransaction>);
+};
+
+export const createPayable = async (p: Partial<Payable>) => {
+  const { data, error } = await from("payables").insert(p).select().single();
+  if (error) throw error;
+  const created = data as Payable;
+  await logActivity("created_payable", "payable", created.id, {
+    payee: created.payee, amount: created.amount,
+  });
+  // A payable can be entered already settled — a bill paid on the spot.
+  await syncPayablePosting(created);
+  return created;
+};
+
+export const updatePayable = async (id: string, p: Partial<Payable>) => {
+  const { data, error } = await from("payables")
+    .update({ ...p, updated_at: new Date().toISOString() }).eq("id", id).select().single();
+  if (error) throw error;
+  const updated = data as Payable;
+  await logActivity("updated_payable", "payable", id, { payee: updated.payee });
+  await syncPayablePosting(updated);
+  return updated;
+};
+
+export const deletePayable = async (id: string) => {
+  // Drop the withdrawal first: once the payable is gone its posting is
+  // unattributable, and ON DELETE SET NULL would strand it in the ledger.
+  const { data: posted } = await from("cash_transactions")
+    .select("id").eq("payable_id", id).maybeSingle();
+  if (posted) await deleteCashTransaction((posted as any).id);
+
+  const { error } = await from("payables").delete().eq("id", id);
+  if (error) throw error;
+  await logActivity("deleted_payable", "payable", id);
+};

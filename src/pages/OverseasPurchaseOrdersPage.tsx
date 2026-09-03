@@ -1,0 +1,1906 @@
+import { useMemo, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  getOverseasPurchaseOrders, createOverseasPurchaseOrder, updateOverseasPurchaseOrder, deleteOverseasPurchaseOrder,
+  getOverseasSuppliers, generateOverseasPONumber, getOverseasPOItems, createOverseasPOItems, deleteOverseasPOItems, getItems, getItemsWithStock, receiveOverseasPO, unreceiveOverseasPO, getAllOverseasPOItems, getShipments,
+  createShipment, updateShipment, deleteShipment,
+} from "@/lib/api";
+import type { ShipmentTracking } from "@/types/database";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Plus, Pencil, Trash2, ShoppingCart, Eye, X, PackageCheck, Upload, Search, FileDown, Truck, BadgeDollarSign } from "lucide-react";
+
+import ExportButton from "@/components/ExportButton";
+import OverseasPOBulkUploadDialog from "@/components/OverseasPOBulkUploadDialog";
+import { DocumentPreview } from "@/components/DocumentPreview";
+import { toast } from "sonner";
+import { peso } from "@/lib/currency";
+import { StatusBadge } from "@/components/StatusBadge";
+import { OverseasPOMobileCard } from "@/components/OverseasPOMobileCard";
+import { ItemSearch } from "@/components/ItemSearch";
+import type { OverseasPurchaseOrder, OverseasSupplier, OverseasPurchaseOrderItem } from "@/types/database";
+import type { DocumentData } from "@/lib/pdf";
+import { Checkbox } from "@/components/ui/checkbox";
+import { BulkEditDialog, type BulkField } from "@/components/BulkEditDialog";
+import { DateField } from "@/components/DateField";
+import { useSort } from "@/hooks/use-sort";
+import { SortableHeader } from "@/components/SortableHeader";
+import { usePermissions } from "@/lib/permissions";
+import { useBranch } from "@/contexts/BranchContext";
+import { supabase } from "@/integrations/supabase/client";
+import { FileText, Image as ImageIcon, ExternalLink } from "lucide-react";
+
+interface LineItem {
+  item_name: string;
+  description: string;
+  quantity: number | "";
+  unit_cost: number | "";
+  item_id: string;
+}
+
+interface IncomingStockRow {
+  id: string;
+  po_id: string;
+  po_number: string;
+  supplier_name: string;
+  status: string;
+  currency: "USD" | "RMB";
+  exchange_rate: number;
+  order_date: string;
+  expected_delivery: string | null;
+  item_name: string;
+  description: string;
+  sku: string;
+  ordered_quantity: number;
+  received_quantity: number;
+  remaining_quantity: number;
+  unit_cost: number;
+  line_total: number;
+  php_value: number;
+}
+
+const emptyLine = (): LineItem => ({ item_name: "", description: "", quantity: "", unit_cost: "", item_id: "" });
+
+// Radix Select cannot hold an empty string, so "no PO" needs a sentinel.
+const NO_PO = "__no_po__";
+
+const emptyTracking = () => ({
+  po_id: "",
+  tracking_number: "",
+  shipping_method: "",
+  warehouse_received_date: "",
+  ship_date: "",
+  estimated_arrival: "",
+  actual_arrival: "",
+  status: "in_transit" as ShipmentTracking["status"],
+  notes: "",
+});
+
+const TRACKING_STATUS_LABELS: Record<ShipmentTracking["status"], string> = {
+  in_transit: "In Transit",
+  customs: "At Customs",
+  delivered: "Delivered",
+};
+
+// Shipment statuses are their own vocabulary — StatusBadge maps PO and invoice
+// statuses, and teaching it these would mix two unrelated sets.
+const TRACKING_STATUS_STYLES: Record<ShipmentTracking["status"], string> = {
+  in_transit: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
+  customs: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400",
+  delivered: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
+};
+
+function TrackingStatusBadge({ status }: { status: ShipmentTracking["status"] }) {
+  return (
+    <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${TRACKING_STATUS_STYLES[status] || ""}`}>
+      {TRACKING_STATUS_LABELS[status] || status}
+    </span>
+  );
+}
+
+export default function OverseasPurchaseOrdersPage() {
+  const queryClient = useQueryClient();
+  const { isAdmin } = usePermissions();
+  const { branches, activeBranchId } = useBranch();
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<OverseasPurchaseOrder | null>(null);
+  const [supplierId, setSupplierId] = useState("");
+  const [status, setStatus] = useState<string>("unpaid");
+  const [orderDate, setOrderDate] = useState("");
+  const [expectedDelivery, setExpectedDelivery] = useState("");
+  const [notes, setNotes] = useState("");
+  const [branchId, setBranchId] = useState("");
+  const [lines, setLines] = useState<LineItem[]>([emptyLine()]);
+  const [exchangeRate, setExchangeRate] = useState("1");
+  const [currency, setCurrency] = useState<"USD" | "RMB">("USD");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkUploadOpen, setBulkUploadOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "not_shipped" | "incoming" | "received">("all");
+  const [incomingSearch, setIncomingSearch] = useState("");
+  const [incomingSupplierFilter, setIncomingSupplierFilter] = useState<string>("all");
+  const [incomingReceiptFilter, setIncomingReceiptFilter] = useState<string>("incoming");
+  const [previewData, setPreviewData] = useState<DocumentData | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  const toggleAll = () => {
+    if (filteredOrders.length > 0 && filteredOrders.every((o) => selectedIds.has(o.id))) setSelectedIds(new Set());
+    else setSelectedIds(new Set(filteredOrders.map((o) => o.id)));
+  };
+  const toggleOne = (id: string) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSelectedIds(next);
+  };
+
+  const bulkDeleteMut = useMutation({
+    mutationFn: async () => { for (const id of selectedIds) await deleteOverseasPurchaseOrder(id); },
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["overseas_pos"] }); queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] }); setSelectedIds(new Set()); toast.success(`Deleted ${selectedIds.size} POs`); },
+  });
+
+  // View dialog
+  const [viewPO, setViewPO] = useState<OverseasPurchaseOrder | null>(null);
+
+  // Receive dialog
+  const [receiveOpen, setReceiveOpen] = useState<string | null>(null);
+  const [receiveBranchId, setReceiveBranchId] = useState<string>("");
+  const [receiveQtys, setReceiveQtys] = useState<Record<string, number>>({});
+  const [undoQtys, setUndoQtys] = useState<Record<string, number>>({});
+  const [receiveLocations, setReceiveLocations] = useState<Record<string, "warehouse" | "store">>({});
+  const [receiveDate, setReceiveDate] = useState<string>(new Date().toISOString().split("T")[0]);
+
+  // Receipt upload
+  const [uploadingReceipt, setUploadingReceipt] = useState(false);
+  const receiptPath = (viewPO as any)?.receipt_url as string | null | undefined;
+  const { data: receiptSignedUrl } = useQuery({
+    queryKey: ["overseas_po_receipt", viewPO?.id, receiptPath],
+    queryFn: async () => {
+      if (!receiptPath) return null;
+      const { data } = await supabase.storage.from("overseas-po-receipts").createSignedUrl(receiptPath, 3600);
+      return data?.signedUrl || null;
+    },
+    enabled: !!viewPO && !!receiptPath,
+  });
+
+  const handleReceiptUpload = async (file: File) => {
+    if (!viewPO) return;
+    setUploadingReceipt(true);
+    try {
+      // A pasted screenshot often arrives with no filename, so fall back to the
+      // MIME type rather than saving a file with no extension.
+      const nameExt = file.name.includes(".") ? file.name.split(".").pop() : "";
+      const ext = nameExt || file.type.split("/").pop() || "bin";
+      const path = `${viewPO.id}/${Date.now()}.${ext}`;
+      const { error: upErr } = await supabase.storage
+        .from("overseas-po-receipts")
+        .upload(path, file, { upsert: true, contentType: file.type });
+      if (upErr) throw upErr;
+      // remove old file if exists
+      if (receiptPath && receiptPath !== path) {
+        await supabase.storage.from("overseas-po-receipts").remove([receiptPath]);
+      }
+      await updateOverseasPurchaseOrder(viewPO.id, { receipt_url: path } as any);
+      const updated = { ...viewPO, receipt_url: path } as any;
+      setViewPO(updated);
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      toast.success("Receipt uploaded");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to upload receipt");
+    } finally {
+      setUploadingReceipt(false);
+    }
+  };
+
+  /** Screenshots are how these receipts usually arrive — from chat, not a scanner. */
+  const handleReceiptPaste = (e: React.ClipboardEvent) => {
+    if (uploadingReceipt) return;
+    const item = Array.from(e.clipboardData.items).find((i) => i.type.startsWith("image/"));
+    const file = item?.getAsFile();
+    if (file) {
+      e.preventDefault();
+      handleReceiptUpload(file);
+    }
+  };
+
+  const handleReceiptRemove = async () => {
+    if (!viewPO || !receiptPath) return;
+    try {
+      await supabase.storage.from("overseas-po-receipts").remove([receiptPath]);
+      await updateOverseasPurchaseOrder(viewPO.id, { receipt_url: null } as any);
+      setViewPO({ ...viewPO, receipt_url: null } as any);
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      toast.success("Receipt removed");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to remove receipt");
+    }
+  };
+
+
+  const { data: orders = [], isLoading } = useQuery<OverseasPurchaseOrder[]>({ queryKey: ["overseas_pos"], queryFn: getOverseasPurchaseOrders });
+  const statusBuckets: Record<string, "not_shipped" | "incoming" | "received"> = {
+    unpaid: "not_shipped",
+    paid_not_shipped: "not_shipped",
+    draft: "not_shipped",
+    shipped_not_paid: "incoming",
+    shipped: "incoming",
+    sent: "incoming",
+    partially_received: "incoming",
+    received: "received",
+  };
+  const branchNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const b of branches) m.set(b.id, `${b.branch_name} (${b.branch_code})`);
+    return m;
+  }, [branches]);
+  const filteredOrders = orders.filter((order: any) => {
+    if (activeBranchId && order.branch_id !== activeBranchId) return false;
+    if (statusFilter !== "all" && statusBuckets[order.status] !== statusFilter) return false;
+
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      order.po_number,
+      order.overseas_suppliers?.name,
+      order.status,
+      order.currency,
+      order.order_date,
+      order.expected_delivery,
+      order.notes,
+      branchNameById.get(order.branch_id) || "",
+    ].some((value) => (value || "").toString().toLowerCase().includes(q));
+  });
+  const bucketCounts = orders.reduce(
+    (acc, o: any) => {
+      const b = statusBuckets[o.status];
+      if (b) acc[b]++;
+      return acc;
+    },
+    { not_shipped: 0, incoming: 0, received: 0 } as Record<string, number>,
+  );
+  const { data: suppliers = [] } = useQuery<OverseasSupplier[]>({ queryKey: ["overseas_suppliers"], queryFn: getOverseasSuppliers });
+  // Stock shown by ItemSearch must come from item_branch_stock, not items.quantity.
+  const { data: inventoryItems = [] } = useQuery({ queryKey: ["items-with-stock", activeBranchId], queryFn: () => getItemsWithStock(activeBranchId) });
+  const { data: allPOItems = [] } = useQuery<OverseasPurchaseOrderItem[]>({ queryKey: ["overseas_po_items_all"], queryFn: getAllOverseasPOItems });
+  const { data: shipments = [] } = useQuery<ShipmentTracking[]>({ queryKey: ["shipments"], queryFn: getShipments });
+
+  // ---- Tracking tab ----
+  const [trackOpen, setTrackOpen] = useState(false);
+  const [trackEditing, setTrackEditing] = useState<ShipmentTracking | null>(null);
+  const [trackForm, setTrackForm] = useState(emptyTracking());
+  const [trackSearch, setTrackSearch] = useState("");
+  const [trackStatusFilter, setTrackStatusFilter] = useState<"all" | ShipmentTracking["status"]>("all");
+
+  const invalidateShipments = () => queryClient.invalidateQueries({ queryKey: ["shipments"] });
+  const trackCreateMut = useMutation({
+    mutationFn: (data: Partial<ShipmentTracking>) => createShipment(data),
+    onSuccess: () => { invalidateShipments(); setTrackOpen(false); toast.success("Tracking added"); },
+    onError: (e: any) => toast.error(e?.message || "Failed to save tracking"),
+  });
+  const trackUpdateMut = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Partial<ShipmentTracking> }) => updateShipment(id, data),
+    onSuccess: () => { invalidateShipments(); setTrackOpen(false); toast.success("Tracking updated"); },
+    onError: (e: any) => toast.error(e?.message || "Failed to save tracking"),
+  });
+  const trackDeleteMut = useMutation({
+    mutationFn: deleteShipment,
+    onSuccess: () => { invalidateShipments(); toast.success("Tracking deleted"); },
+    onError: (e: any) => toast.error(e?.message || "Failed to delete tracking"),
+  });
+
+  const openTrackCreate = (poId?: string) => {
+    setTrackEditing(null);
+    setTrackForm({ ...emptyTracking(), po_id: poId || "" });
+    setTrackOpen(true);
+  };
+  /**
+   * Tracking for one PO, from the Purchase Orders tab. Edits the shipment
+   * already against that PO if there is one, so the button does not quietly
+   * create a second record for the same order.
+   */
+  const openTrackFor = (po: OverseasPurchaseOrder) => {
+    const existing = shipmentByPo.get(po.id);
+    if (existing) openTrackEdit(existing);
+    else openTrackCreate(po.id);
+  };
+
+  const openTrackEdit = (s: ShipmentTracking) => {
+    setTrackEditing(s);
+    setTrackForm({
+      po_id: s.po_id || "",
+      tracking_number: s.tracking_number || "",
+      shipping_method: s.shipping_method || "",
+      warehouse_received_date: s.warehouse_received_date || "",
+      ship_date: s.ship_date || "",
+      estimated_arrival: s.estimated_arrival || "",
+      actual_arrival: s.actual_arrival || "",
+      status: s.status,
+      notes: s.notes || "",
+    });
+    setTrackOpen(true);
+  };
+
+  const handleTrackSubmit = () => {
+    if (!trackForm.tracking_number.trim()) { toast.error("Tracking number is required"); return; }
+    if (trackForm.status === "delivered" && !trackForm.actual_arrival) {
+      toast.error("Set the arrival date when marking a shipment delivered");
+      return;
+    }
+    const data: Partial<ShipmentTracking> = {
+      po_id: trackForm.po_id || null,
+      tracking_number: trackForm.tracking_number.trim(),
+      shipping_method: trackForm.shipping_method.trim(),
+      warehouse_received_date: trackForm.warehouse_received_date || null,
+      ship_date: trackForm.ship_date || null,
+      estimated_arrival: trackForm.estimated_arrival || null,
+      actual_arrival: trackForm.actual_arrival || null,
+      status: trackForm.status,
+      notes: trackForm.notes,
+    };
+    if (trackEditing) trackUpdateMut.mutate({ id: trackEditing.id, data });
+    else trackCreateMut.mutate(data);
+  };
+
+  // Rows carry the PO and supplier names so the tab reads without opening a PO.
+  const trackingRows = useMemo(() => {
+    const byId = new Map(orders.map((o: any) => [o.id, o]));
+    const rows = shipments.map((s) => {
+      const po: any = s.po_id ? byId.get(s.po_id) : null;
+      return {
+        shipment: s,
+        po_number: po?.po_number || "—",
+        supplier: po?.overseas_suppliers?.name || "—",
+      };
+    });
+    const byStatus = trackStatusFilter === "all"
+      ? rows
+      : rows.filter((r) => r.shipment.status === trackStatusFilter);
+
+    const q = trackSearch.trim().toLowerCase();
+    if (!q) return byStatus;
+    return byStatus.filter((r) =>
+      [r.shipment.tracking_number, r.po_number, r.supplier, r.shipment.shipping_method]
+        .some((v) => (v || "").toLowerCase().includes(q)),
+    );
+  }, [shipments, orders, trackSearch, trackStatusFilter]);
+  const shipmentByPo = useMemo(() => {
+    const map = new Map<string, ShipmentTracking>();
+    for (const s of shipments) {
+      if (!s.po_id) continue;
+      const existing = map.get(s.po_id);
+      // prefer most recent (by ship_date or estimated_arrival)
+      if (!existing) map.set(s.po_id, s);
+      else {
+        const a = new Date(s.ship_date || s.estimated_arrival || s.created_at || 0).getTime();
+        const b = new Date(existing.ship_date || existing.estimated_arrival || existing.created_at || 0).getTime();
+        if (a > b) map.set(s.po_id, s);
+      }
+    }
+    return map;
+  }, [shipments]);
+  const { sort, toggle, sorted: sortedOrders } = useSort<OverseasPurchaseOrder>(filteredOrders, {
+    po_number: (r) => r.po_number,
+    supplier: (r: any) => r.overseas_suppliers?.name || "",
+    branch: (r: any) => branchNameById.get(r.branch_id) || "",
+    status: (r) => r.status,
+    currency: (r) => r.currency,
+    total_amount: (r) => Number(r.total_amount),
+    php_total: (r) => Number(r.total_amount) * Number(r.exchange_rate || 1),
+    order_date: (r) => r.order_date,
+    expected_delivery: (r) => r.expected_delivery,
+    eta: (r) => {
+      const a = arrivalFor(r.id, r.expected_delivery);
+      return a ? new Date(a.date).getTime() : null;
+    },
+  });
+  /**
+   * The arrival date to show for a PO, and whether it is confirmed or a forecast.
+   * A shipment marked delivered wins; otherwise the latest date the goods were
+   * actually received counts as arrival. Anything else is an estimate and is
+   * labelled as one, so a forecast is never mistaken for a real arrival.
+   */
+  const arrivalFor = (poId: string, expectedDelivery: string | null) => {
+    const shipment = shipmentByPo.get(poId);
+    if (shipment?.actual_arrival) return { date: shipment.actual_arrival, confirmed: true };
+    const receivedDates = (allPOItems as any[])
+      .filter((i) => i.po_id === poId && i.received_date)
+      .map((i) => i.received_date as string)
+      .sort();
+    if (receivedDates.length) return { date: receivedDates[receivedDates.length - 1], confirmed: true };
+    const estimate = shipment?.estimated_arrival || expectedDelivery;
+    return estimate ? { date: estimate, confirmed: false } : null;
+  };
+
+  const itemsByPo = useMemo(() => {
+    const map = new Map<string, OverseasPurchaseOrderItem[]>();
+    for (const it of allPOItems) {
+      const arr = map.get(it.po_id) || [];
+      arr.push(it);
+      map.set(it.po_id, arr);
+    }
+    return map;
+  }, [allPOItems]);
+  const { data: viewItems = [] } = useQuery<OverseasPurchaseOrderItem[]>({
+    queryKey: ["overseas_po_items", viewPO?.id],
+    queryFn: () => getOverseasPOItems(viewPO!.id),
+    enabled: !!viewPO,
+  });
+  const { data: receiveItems = [] } = useQuery<OverseasPurchaseOrderItem[]>({
+    queryKey: ["overseas_po_items", receiveOpen],
+    queryFn: () => getOverseasPOItems(receiveOpen!),
+    enabled: !!receiveOpen,
+  });
+
+  const createMut = useMutation({
+    mutationFn: async () => {
+      const bId = branchId || activeBranchId;
+      if (!bId) throw new Error("Please select a branch before creating this PO.");
+      const poNumber = await generateOverseasPONumber();
+      const normalized = lines.map(l => ({ ...l, quantity: Number(l.quantity) || 0, unit_cost: Number(l.unit_cost) || 0 }));
+      const total = normalized.reduce((s, l) => s + l.quantity * l.unit_cost, 0);
+      const po = await createOverseasPurchaseOrder({
+        po_number: poNumber,
+        supplier_id: supplierId || null,
+        status: status as any,
+        order_date: orderDate || new Date().toISOString().slice(0, 10),
+        expected_delivery: expectedDelivery || null,
+        notes,
+        total_amount: total,
+        currency,
+        exchange_rate: parseFloat(exchangeRate) || 1,
+        branch_id: bId,
+      } as any);
+      const valid = normalized.filter(l => l.item_name);
+      if (valid.length > 0) {
+        await createOverseasPOItems(valid.map(l => ({ po_id: po.id, item_name: l.item_name, description: l.description, quantity: l.quantity, unit_cost: l.unit_cost, item_id: l.item_id || null })));
+      }
+      return po;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] });
+      setOpen(false);
+      toast.success("Overseas PO created");
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const updateMut = useMutation({
+    mutationFn: async () => {
+      if (!editing) throw new Error("No PO selected for editing");
+      const normalized = lines.map(l => ({ ...l, quantity: Number(l.quantity) || 0, unit_cost: Number(l.unit_cost) || 0 }));
+      const total = normalized.reduce((s, l) => s + l.quantity * l.unit_cost, 0);
+      // Update the existing PO in place — never generate a new po_number or insert a new row.
+      const updated = await updateOverseasPurchaseOrder(editing.id, {
+        supplier_id: supplierId || null,
+        status: status as any,
+        order_date: orderDate || null,
+        expected_delivery: expectedDelivery || null,
+        notes,
+        total_amount: total,
+        currency,
+        exchange_rate: parseFloat(exchangeRate) || 1,
+        ...(branchId ? { branch_id: branchId } : {}),
+      } as any);
+      await deleteOverseasPOItems(editing.id);
+      const valid = normalized.filter(l => l.item_name);
+      if (valid.length > 0) {
+        await createOverseasPOItems(valid.map(l => ({ po_id: editing.id, item_name: l.item_name, description: l.description, quantity: l.quantity, unit_cost: l.unit_cost, item_id: l.item_id || null })));
+      }
+      return updated;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items", editing?.id] });
+      setOpen(false);
+      setEditing(null);
+      toast.success("Purchase Order updated successfully.");
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: deleteOverseasPurchaseOrder,
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["overseas_pos"] }); queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] }); toast.success("Deleted"); },
+  });
+
+  // ---- Shipped / Paid quick toggles ----
+  const isPaidStatus = (s: string) => ["paid_not_shipped", "shipped", "partially_received", "pending_cargo_adjustment", "cargo_adjusted", "received"].includes(s);
+  const isShippedStatus = (s: string) => ["shipped", "shipped_not_paid", "partially_received", "pending_cargo_adjustment", "cargo_adjusted", "received"].includes(s);
+  const statusFromFlags = (paid: boolean, shipped: boolean) =>
+    paid && shipped ? "shipped" : paid ? "paid_not_shipped" : shipped ? "shipped_not_paid" : "unpaid";
+
+  const statusMut = useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: string }) =>
+      updateOverseasPurchaseOrder(id, { status } as any),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      toast.success("Status updated");
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const toggleFlag = (po: OverseasPurchaseOrder, flag: "paid" | "shipped") => {
+    const paid = isPaidStatus(po.status);
+    const shipped = isShippedStatus(po.status);
+    const next = flag === "paid" ? statusFromFlags(!paid, shipped) : statusFromFlags(paid, !shipped);
+    statusMut.mutate({ id: po.id, status: next });
+  };
+
+
+  const receiveMut = useMutation({
+    mutationFn: async () => {
+      const itemsToReceive = Object.entries(receiveQtys)
+        .filter(([, qty]) => qty > 0)
+        .map(([poItemId, qty]) => {
+          const pi = receiveItems.find((i) => i.id === poItemId);
+          return {
+            poItemId,
+            itemId: pi?.item_id || null,
+            quantity: qty,
+            location: receiveLocations[poItemId] || "warehouse",
+          };
+        });
+      if (itemsToReceive.length === 0) {
+        toast.info("Enter a quantity for at least one item");
+        return;
+      }
+      const po: any = (orders as any[]).find((o: any) => o.id === receiveOpen);
+      const override = isAdmin && receiveBranchId && receiveBranchId !== po?.branch_id ? receiveBranchId : null;
+      await receiveOverseasPO(receiveOpen!, itemsToReceive, receiveDate, override);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items", receiveOpen] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] });
+      queryClient.invalidateQueries({ queryKey: ["items"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      setReceiveOpen(null);
+      setReceiveQtys({});
+      setUndoQtys({});
+      setReceiveLocations({});
+      setReceiveDate(new Date().toISOString().split("T")[0]);
+      toast.success("Items received and added to stock");
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const undoMut = useMutation({
+    mutationFn: async () => {
+      const itemsToUndo = Object.entries(undoQtys)
+        .filter(([, qty]) => qty > 0)
+        .map(([poItemId, qty]) => {
+          const pi = receiveItems.find((i) => i.id === poItemId);
+          return { poItemId, itemId: pi?.item_id || null, quantity: qty };
+        });
+      if (itemsToUndo.length === 0) throw new Error("Enter quantities to undo");
+      await unreceiveOverseasPO(receiveOpen!, itemsToUndo);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items", receiveOpen] });
+      queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] });
+      queryClient.invalidateQueries({ queryKey: ["items"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      setUndoQtys({});
+      toast.success("Receipt reversed and inventory deducted");
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const openCreate = () => {
+    setEditing(null);
+    setSupplierId("");
+    setStatus("unpaid");
+    setOrderDate(new Date().toISOString().slice(0, 10));
+    setExpectedDelivery("");
+    setNotes("");
+    setLines([emptyLine()]);
+    setCurrency("USD");
+    setExchangeRate("1");
+    setBranchId(activeBranchId || "");
+    setOpen(true);
+  };
+
+  const openEdit = async (po: OverseasPurchaseOrder) => {
+    setEditing(po);
+    setSupplierId(po.supplier_id || "");
+    setStatus(po.status);
+    setOrderDate(po.order_date || "");
+    setExpectedDelivery(po.expected_delivery || "");
+    setNotes(po.notes);
+    setCurrency(po.currency);
+    setExchangeRate(String(po.exchange_rate));
+    setBranchId((po as any).branch_id || "");
+    const poItems = await getOverseasPOItems(po.id);
+    setLines(poItems.length > 0 ? poItems.map(i => ({ item_name: i.item_name, description: i.description, quantity: i.quantity, unit_cost: i.unit_cost, item_id: i.item_id || "" })) : [emptyLine()]);
+    setOpen(true);
+  };
+
+  const handleSupplierChange = (id: string) => {
+    setSupplierId(id);
+    const sup = suppliers.find(s => s.id === id);
+    if (sup) {
+      setCurrency(sup.currency);
+      setExchangeRate(String(sup.exchange_rate));
+    }
+  };
+
+  const updateLine = (idx: number, field: keyof LineItem, value: string | number) => {
+    setLines(lines.map((l, i) => i === idx ? { ...l, [field]: value } : l));
+  };
+
+  const openPreview = async (po: OverseasPurchaseOrder) => {
+    const poItems = await getOverseasPOItems(po.id);
+    setPreviewData({
+      type: "purchase_order",
+      number: po.po_number,
+      date: po.order_date || "",
+      status: po.status,
+      currencyCode: po.currency,
+      currencySymbol: po.currency === "USD" ? "$" : "¥",
+      notes: po.notes || "",
+      recipientLabel: "Supplier",
+      recipientName: po.overseas_suppliers?.name || "—",
+      recipientContact: po.overseas_suppliers?.contact_person || undefined,
+      recipientEmail: po.overseas_suppliers?.email || undefined,
+      recipientPhone: po.overseas_suppliers?.phone || undefined,
+      recipientAddress: po.overseas_suppliers?.address || undefined,
+      extraFields: [
+        { label: "Currency", value: po.currency },
+        { label: "Exchange Rate", value: String(po.exchange_rate || 1) },
+        ...(po.expected_delivery ? [{ label: "ETA", value: po.expected_delivery }] : []),
+      ],
+      items: poItems.map((item) => ({
+        name: item.item_name || item.items?.name || "—",
+        sku: item.items?.sku || undefined,
+        quantity: Number(item.quantity || 0),
+        unitPrice: Number(item.unit_cost || 0),
+        total: Number(item.quantity || 0) * Number(item.unit_cost || 0),
+      })),
+      totalAmount: Number(po.total_amount || 0),
+    });
+    setPreviewOpen(true);
+  };
+
+  const addLine = () => setLines([...lines, emptyLine()]);
+  const removeLine = (idx: number) => setLines(lines.filter((_, i) => i !== idx));
+
+  const foreignTotal = lines.reduce((s, l) => s + (Number(l.quantity) || 0) * (Number(l.unit_cost) || 0), 0);
+  const phpTotal = foreignTotal * (parseFloat(exchangeRate) || 0);
+  const currencySymbol = currency === "USD" ? "$" : "¥";
+
+  const incomingRows = useMemo<IncomingStockRow[]>(() => {
+    const ordersById = new Map(orders.map((order) => [order.id, order]));
+
+    return allPOItems.filter((item) => {
+      if (!activeBranchId) return true;
+      const po: any = ordersById.get(item.po_id);
+      return po?.branch_id === activeBranchId;
+    }).map((item) => {
+      const po = ordersById.get(item.po_id);
+      const orderedQuantity = Number(item.quantity || 0);
+      const rawReceived = Number(item.received_quantity || 0);
+      // A PO closed as "received" is done, even if its line items were never
+      // ticked off individually — that happens when the status is set from the
+      // edit dialog instead of the Receive flow. Without this, the leftover
+      // quantities resurface here as phantom incoming stock.
+      const poReceived = po?.status === "received";
+      const receivedQuantity = poReceived ? orderedQuantity : rawReceived;
+      const remainingQuantity = poReceived ? 0 : Math.max(0, orderedQuantity - rawReceived);
+      const unitCost = Number(item.unit_cost || 0);
+      const lineTotal = orderedQuantity * unitCost;
+      const exchangeRate = Number(po?.exchange_rate || 1);
+
+      return {
+        id: item.id,
+        po_id: item.po_id,
+        po_number: po?.po_number || "—",
+        supplier_name: po?.overseas_suppliers?.name || "—",
+        status: po?.status || "unpaid",
+        currency: (po?.currency || "USD") as "USD" | "RMB",
+        exchange_rate: exchangeRate,
+        order_date: po?.order_date || "",
+        expected_delivery: po?.expected_delivery || null,
+        item_name: item.item_name,
+        description: item.description || "",
+        sku: item.items?.sku || "",
+        ordered_quantity: orderedQuantity,
+        received_quantity: receivedQuantity,
+        remaining_quantity: remainingQuantity,
+        unit_cost: unitCost,
+        line_total: lineTotal,
+        php_value: lineTotal * exchangeRate,
+      };
+    });
+  }, [allPOItems, orders, activeBranchId]);
+
+  const filteredIncomingRows = incomingRows.filter((row) => {
+    const q = incomingSearch.trim().toLowerCase();
+    const matchesSearch = !q || [
+      row.po_number,
+      row.supplier_name,
+      row.item_name,
+      row.description,
+      row.sku,
+      row.status,
+      row.order_date,
+      row.expected_delivery,
+    ].some((value) => (value || "").toString().toLowerCase().includes(q));
+
+    const matchesSupplier = incomingSupplierFilter === "all" || row.supplier_name === incomingSupplierFilter;
+    const matchesReceipt =
+      incomingReceiptFilter === "all" ||
+      (incomingReceiptFilter === "incoming" && row.remaining_quantity > 0) ||
+      (incomingReceiptFilter === "received" && row.remaining_quantity === 0) ||
+      (incomingReceiptFilter === "partial" && row.received_quantity > 0 && row.remaining_quantity > 0) ||
+      (incomingReceiptFilter === "unreceived" && row.received_quantity === 0);
+
+    return matchesSearch && matchesSupplier && matchesReceipt;
+  });
+
+  const {
+    sort: incomingSort,
+    toggle: toggleIncomingSort,
+    sorted: sortedIncomingRows,
+  } = useSort<IncomingStockRow>(filteredIncomingRows, {
+    po_number: (row) => row.po_number,
+    supplier: (row) => row.supplier_name,
+    product: (row) => row.item_name,
+    sku: (row) => row.sku,
+    ordered: (row) => row.ordered_quantity,
+    received: (row) => row.received_quantity,
+    remaining: (row) => row.remaining_quantity,
+    unit_cost: (row) => row.unit_cost,
+    line_total: (row) => row.line_total,
+    php_value: (row) => row.php_value,
+    order_date: (row) => row.order_date,
+    expected_delivery: (row) => row.expected_delivery || "",
+  });
+
+  // Total value of items not yet received across POs that are NOT marked received (in PHP)
+  const notReceivedPhpTotal = (() => {
+    const openPos = new Map(orders.filter(o => o.status !== "received").map(o => [o.id, o.exchange_rate || 1]));
+    let total = 0;
+    for (const li of allPOItems) {
+      const remaining = (li.quantity || 0) - (li.received_quantity || 0);
+      if (remaining <= 0) continue;
+      const rate = openPos.get(li.po_id);
+      if (rate === undefined) continue;
+      total += remaining * (li.unit_cost || 0) * rate;
+    }
+    return total;
+  })();
+
+  const handleSubmit = () => {
+    if (createMut.isPending || updateMut.isPending) return;
+    if (editing) updateMut.mutate();
+    else createMut.mutate();
+  };
+
+  /**
+   * Row actions for one overseas PO. Shared by the desktop table and the
+   * mobile card so behaviour cannot diverge between them.
+   */
+  const renderOverseasPOActions = (po: any) => (
+    <>
+                    {isAdmin && <Button variant="ghost" size="icon" onClick={() => openPreview(po)} title="Preview & Download PDF" className="h-7 w-7 rounded-md"><FileDown className="h-3.5 w-3.5 text-primary" /></Button>}
+                    <Button variant="ghost" size="icon" onClick={() => setViewPO(po)} className="h-7 w-7 rounded-md"><Eye className="h-3.5 w-3.5 text-muted-foreground" /></Button>
+                    {po.status !== "received" && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => { setReceiveOpen(po.id); setReceiveBranchId((po as any).branch_id || activeBranchId || ""); setReceiveQtys({}); }}
+                        className="h-7 w-7 rounded-md"
+                        title="Receive items"
+                      >
+                        <PackageCheck className="h-3.5 w-3.5 text-success" />
+                      </Button>
+                    )}
+                    {isAdmin && ["unpaid", "draft", "sent", "paid_not_shipped", "shipped_not_paid", "shipped"].includes(po.status) && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => toggleFlag(po, "shipped")}
+                          className="h-7 w-7 rounded-md"
+                          title={isShippedStatus(po.status) ? "Unmark as shipped" : "Mark as shipped"}
+                        >
+                          <Truck className={`h-3.5 w-3.5 ${isShippedStatus(po.status) ? "text-success" : "text-muted-foreground"}`} />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => toggleFlag(po, "paid")}
+                          className="h-7 w-7 rounded-md"
+                          title={isPaidStatus(po.status) ? "Unmark as paid" : "Mark as paid"}
+                        >
+                          <BadgeDollarSign className={`h-3.5 w-3.5 ${isPaidStatus(po.status) ? "text-success" : "text-muted-foreground"}`} />
+                        </Button>
+                      </>
+                    )}
+                    {/* Tracking is entered against the PO you are looking at,
+                        rather than picked from a list of PO numbers later. */}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => openTrackFor(po)}
+                      className="h-7 w-7 rounded-md"
+                      title={shipmentByPo.get(po.id) ? "Edit tracking" : "Add tracking"}
+                    >
+                      <Truck className={`h-3.5 w-3.5 ${shipmentByPo.get(po.id) ? "text-primary" : "text-muted-foreground"}`} />
+                    </Button>
+                    {isAdmin && <Button variant="ghost" size="icon" onClick={() => openEdit(po)} className="h-7 w-7 rounded-md"><Pencil className="h-3.5 w-3.5 text-muted-foreground" /></Button>}
+                    {isAdmin && <Button variant="ghost" size="icon" onClick={() => deleteMut.mutate(po.id)} className="h-7 w-7 rounded-md"><Trash2 className="h-3.5 w-3.5 text-destructive/70" /></Button>}
+    </>
+  );
+
+  return (
+    <div className="space-y-6">
+      <Tabs defaultValue="orders" className="space-y-6">
+        <TabsList>
+          <TabsTrigger value="orders">Purchase Orders</TabsTrigger>
+          <TabsTrigger value="incoming">Incoming Stock</TabsTrigger>
+          <TabsTrigger value="tracking">Tracking</TabsTrigger>
+        </TabsList>
+        <TabsContent value="orders" className="space-y-6 mt-0">
+      <div className="page-toolbar">
+        <div className="page-header mb-0">
+          <h1 className="page-title">Overseas PO</h1>
+          <p className="page-description">{filteredOrders.length} order{filteredOrders.length !== 1 ? "s" : ""}{filteredOrders.length !== orders.length ? ` (filtered from ${orders.length})` : ""} • Stock added when marked received</p>
+        </div>
+        <div className="toolbar-actions">
+          {isAdmin && selectedIds.size > 0 && (
+            <>
+              <BulkEditDialog
+                selectedIds={Array.from(selectedIds)}
+                entityLabel="overseas POs"
+                fields={[
+                  { key: "status", label: "Status", type: "select", options: [
+                    { value: "unpaid", label: "Unpaid" },
+                    { value: "paid_not_shipped", label: "Paid, Not Shipped" },
+                    { value: "shipped_not_paid", label: "Shipped, Not Paid (Terms)" },
+                    { value: "shipped", label: "Shipped" },
+                    { value: "partially_received", label: "Partially Received" },
+                    { value: "received", label: "Received" },
+                  ]},
+                  { key: "currency", label: "Currency", type: "select", options: [{ value: "USD", label: "USD" }, { value: "RMB", label: "RMB" }] },
+                  { key: "exchange_rate", label: "Exchange Rate", type: "number", transform: v => parseFloat(v) || 1 },
+                  { key: "order_date", label: "Date Ordered", type: "date" },
+                  { key: "expected_delivery", label: "Estimated Date of Arrival", type: "date" },
+                  { key: "notes", label: "Notes", type: "textarea" },
+                ] as BulkField[]}
+                updateOne={async (id, patch) => { await updateOverseasPurchaseOrder(id, patch as any); }}
+                onSuccess={() => { queryClient.invalidateQueries({ queryKey: ["overseas_pos"] }); setSelectedIds(new Set()); }}
+              />
+              <Button variant="destructive" size="sm" onClick={() => bulkDeleteMut.mutate()} disabled={bulkDeleteMut.isPending}>
+                <Trash2 className="h-4 w-4 mr-1" /> Delete {selectedIds.size} selected
+              </Button>
+            </>
+          )}
+          {isAdmin && (
+            <ExportButton
+              data={orders}
+              columns={{
+                "PO #": (r: any) => r.po_number,
+                "Order Date": (r: any) => r.order_date,
+                "Supplier": (r: any) => r.overseas_suppliers?.name || "",
+                "Status": (r: any) => r.status,
+                "Currency": (r: any) => r.currency,
+                "Exchange Rate": (r: any) => r.exchange_rate,
+                "Expected Delivery": (r: any) => r.expected_delivery || "",
+                "PO Total": (r: any) => r.total_amount,
+                "Notes": (r: any) => r.notes || "",
+              }}
+              childItems={{
+                table: "overseas_purchase_order_items",
+                foreignKey: "po_id",
+                select: "*, items(name, sku)",
+                columns: {
+                  "Item Name": (li: any) => li.item_name || li.items?.name || "",
+                  "SKU": (li: any) => li.items?.sku || "",
+                  "Description": (li: any) => li.description || "",
+                  "Quantity": (li: any) => Number(li.quantity || 0),
+                  "Received": (li: any) => Number(li.received_quantity || 0),
+                  "Received Date": (li: any) => li.received_date || "",
+                  "Unit Cost": (li: any) => Number(li.unit_cost || 0),
+                  "Line Total": (li: any) => Number(li.quantity || 0) * Number(li.unit_cost || 0),
+                },
+              }}
+              dateField={(r: any) => r.order_date || ""}
+              fileName="Overseas_POs"
+            />
+          )}
+          {isAdmin && (
+            <Button variant="outline" onClick={() => setBulkUploadOpen(true)} className="rounded-lg h-9 px-4 text-sm font-medium">
+              <Upload className="h-4 w-4 mr-1.5" /> Bulk Upload
+            </Button>
+          )}
+          {isAdmin && (
+            <Button onClick={openCreate} className="rounded-lg h-9 px-4 text-sm font-medium">
+              <Plus className="h-4 w-4 mr-1.5" /> New Overseas PO
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative max-w-sm flex-1 min-w-[200px]">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="Search overseas POs..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="pl-9"
+          />
+        </div>
+        <div className="inline-flex rounded-lg border bg-card p-0.5">
+          {([
+            { key: "all", label: `All (${orders.length})` },
+            { key: "not_shipped", label: `Not Shipped (${bucketCounts.not_shipped})` },
+            { key: "incoming", label: `Incoming (${bucketCounts.incoming})` },
+            { key: "received", label: `Received (${bucketCounts.received})` },
+          ] as const).map((b) => (
+            <button
+              key={b.key}
+              type="button"
+              onClick={() => setStatusFilter(b.key as any)}
+              className={`px-3 h-8 text-xs font-medium rounded-md transition-colors ${
+                statusFilter === b.key
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-muted"
+              }`}
+            >
+              {b.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <OverseasPOBulkUploadDialog
+        open={bulkUploadOpen}
+        onOpenChange={setBulkUploadOpen}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ["overseas_pos"] });
+          queryClient.invalidateQueries({ queryKey: ["overseas_po_items_all"] });
+        }}
+      />
+
+      {/* Create / Edit Dialog */}
+      <Dialog open={open} onOpenChange={(v) => { if (updateMut.isPending || createMut.isPending) return; setOpen(v); if (!v) setEditing(null); }}>
+        <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader><DialogTitle className="text-lg">{editing ? "Edit Overseas PO" : "New Overseas PO"}</DialogTitle></DialogHeader>
+          <div className="grid gap-4 pt-2">
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Branch <span className="text-destructive">*</span></Label>
+              <Select value={branchId} onValueChange={setBranchId} disabled={!isAdmin && branches.length <= 1}>
+                <SelectTrigger className="h-9"><SelectValue placeholder="Select destination branch..." /></SelectTrigger>
+                <SelectContent>
+                  {branches.map(b => (
+                    <SelectItem key={b.id} value={b.id}>{b.branch_name} ({b.branch_code})</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] text-muted-foreground">Stock from this PO will be received into the selected branch.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Overseas Supplier</Label>
+                <Select value={supplierId} onValueChange={handleSupplierChange}>
+                  <SelectTrigger className="h-9"><SelectValue placeholder="Select supplier" /></SelectTrigger>
+                  <SelectContent>
+                    {suppliers.map(s => (
+                      <SelectItem key={s.id} value={s.id}>{s.name} ({s.currency})</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Status</Label>
+                <Select value={status} onValueChange={setStatus}>
+                  <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unpaid">Unpaid</SelectItem>
+                    <SelectItem value="paid_not_shipped">Paid, Not Shipped</SelectItem>
+                    <SelectItem value="shipped_not_paid">Shipped, Not Paid (Terms)</SelectItem>
+                    <SelectItem value="shipped">Shipped</SelectItem>
+                    {/*
+                      Receipt statuses are set by the Receive flow, which also records
+                      per-line received quantities and adds stock. Setting them here
+                      would leave the line items untouched and the PO would resurface
+                      as phantom incoming stock. They stay selectable only when the PO
+                      already carries that status, so editing one does not reset it.
+                    */}
+                    {status === "partially_received" && (
+                      <SelectItem value="partially_received">Partially Received</SelectItem>
+                    )}
+                    {status === "received" && <SelectItem value="received">Received</SelectItem>}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Currency</Label>
+                <Select value={currency} onValueChange={(v: "USD" | "RMB") => setCurrency(v)}>
+                  <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="USD">USD ($)</SelectItem>
+                    <SelectItem value="RMB">RMB (¥)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Exchange Rate to PHP</Label>
+                <Input type="number" value={exchangeRate} onChange={e => setExchangeRate(e.target.value)} className="h-9" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Date Ordered</Label>
+                <DateField value={orderDate} onChange={setOrderDate} />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Estimated Date of Arrival</Label>
+                <DateField value={expectedDelivery} onChange={setExpectedDelivery} />
+              </div>
+            </div>
+
+            {/* Line items */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <Label className="text-xs font-medium">Items</Label>
+                <Button variant="outline" size="sm" onClick={addLine} className="h-7 text-xs"><Plus className="h-3 w-3 mr-1" />Add Item</Button>
+              </div>
+               <div className="space-y-2">
+                 {lines.map((line, idx) => (
+                   <div key={idx} className="space-y-1 border rounded-md p-2 sm:border-0 sm:p-0">
+                     <div className="grid grid-cols-1 sm:grid-cols-[1fr_60px_100px_32px] gap-2 sm:items-end">
+                       <div className="space-y-1">
+                         {idx === 0 && <Label className="text-[10px] text-muted-foreground hidden sm:block">Item (search by SKU)</Label>}
+                         <ItemSearch
+                           items={inventoryItems}
+                           value={line.item_id}
+                            onChange={(itemId, item) => {
+                              const rmb = Number((item as any)?.cost_price_rmb || 0);
+                              const autoCost = currency === "RMB" && rmb > 0 ? rmb : undefined;
+                              setLines(lines.map((l, i) => i === idx ? { ...l, item_id: itemId, item_name: item.name, ...(autoCost !== undefined && (!l.unit_cost || Number(l.unit_cost) === 0) ? { unit_cost: autoCost } : {}) } : l));
+                            }}
+                           placeholder="Search SKU or name..."
+                         />
+                       </div>
+                       <div className="grid grid-cols-[1fr_1fr_32px] gap-2 sm:contents">
+                         <div className="space-y-1">
+                           {idx === 0 && <Label className="text-[10px] text-muted-foreground hidden sm:block">Qty</Label>}
+                           <Input type="number" value={line.quantity} placeholder="Qty" onChange={e => updateLine(idx, "quantity", e.target.value === "" ? "" : (parseInt(e.target.value) || 0))} className="h-8 text-sm" />
+                         </div>
+                         <div className="space-y-1">
+                           {idx === 0 && <Label className="text-[10px] text-muted-foreground hidden sm:block">Unit Cost ({currencySymbol})</Label>}
+                           <Input type="number" value={line.unit_cost} placeholder={`Cost (${currencySymbol})`} onChange={e => updateLine(idx, "unit_cost", e.target.value === "" ? "" : (parseFloat(e.target.value) || 0))} className="h-8 text-sm" />
+                         </div>
+                         <Button variant="ghost" size="icon" onClick={() => removeLine(idx)} className="h-8 w-8 self-end" disabled={lines.length === 1}>
+                           <X className="h-3.5 w-3.5 text-muted-foreground" />
+                         </Button>
+                       </div>
+                     </div>
+                     {!line.item_id && (
+                       <Input value={line.item_name} onChange={e => updateLine(idx, "item_name", e.target.value)} className="h-7 text-xs" placeholder="Or type item name manually" />
+                     )}
+                   </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Totals */}
+            <div className="rounded-lg bg-muted/50 p-3 space-y-1">
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Total ({currency})</span>
+                <span className="font-medium">{currencySymbol}{foreignTotal.toLocaleString("en", { minimumFractionDigits: 2 })}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Total (PHP) @ {exchangeRate}</span>
+                <span className="font-semibold text-primary">{peso(phpTotal)}</span>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Notes</Label>
+              <Textarea value={notes} onChange={e => setNotes(e.target.value)} className="resize-none" rows={2} />
+            </div>
+            <Button onClick={handleSubmit} disabled={createMut.isPending || updateMut.isPending} className="mt-2 rounded-lg h-9">{editing ? (updateMut.isPending ? "Updating..." : "Update") : (createMut.isPending ? "Creating..." : "Create PO")}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* View Dialog */}
+      <Dialog open={!!viewPO} onOpenChange={() => setViewPO(null)}>
+        <DialogContent className="sm:max-w-5xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader><DialogTitle className="text-lg">PO {viewPO?.po_number}</DialogTitle></DialogHeader>
+          {viewPO && (
+            <div className="space-y-5 pt-2">
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div><span className="text-muted-foreground">Supplier:</span> <span className="font-medium">{viewPO.overseas_suppliers?.name || "—"}</span></div>
+                <div><span className="text-muted-foreground">Status:</span> <StatusBadge status={viewPO.status} context="overseas_po" /></div>
+                {isAdmin && <div><span className="text-muted-foreground">Currency:</span> {viewPO.currency}</div>}
+                {isAdmin && <div><span className="text-muted-foreground">Rate:</span> {viewPO.exchange_rate}</div>}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-lg border bg-card p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Products</p>
+                  <p className="mt-1 text-2xl font-semibold">{viewItems.length}</p>
+                </div>
+                <div className="rounded-lg border bg-card p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Ordered Qty</p>
+                  <p className="mt-1 text-2xl font-semibold">{viewItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0)}</p>
+                </div>
+                <div className="rounded-lg border bg-card p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Received Qty</p>
+                  <p className="mt-1 text-2xl font-semibold">{viewItems.reduce((sum, item) => sum + Number(item.received_quantity || 0), 0)}</p>
+                </div>
+                <div className="rounded-lg border bg-card p-4">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Remaining Qty</p>
+                  <p className="mt-1 text-2xl font-semibold">
+                    {viewItems.reduce((sum, item) => sum + Math.max(0, Number(item.quantity || 0) - Number(item.received_quantity || 0)), 0)}
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border bg-card">
+                <div className="border-b px-4 py-3">
+                  <h3 className="text-sm font-semibold">Ordered Products Breakdown</h3>
+                  <p className="text-xs text-muted-foreground">Per-product quantities, receiving progress, and value.</p>
+                </div>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="text-xs">SKU</TableHead>
+                      <TableHead className="text-xs">Product</TableHead>
+                      <TableHead className="text-xs">Description</TableHead>
+                      <TableHead className="text-xs text-right">Ordered</TableHead>
+                      <TableHead className="text-xs text-right">Received</TableHead>
+                      <TableHead className="text-xs text-right">Remaining</TableHead>
+                      <TableHead className="text-xs">Date Received</TableHead>
+                      {isAdmin && <TableHead className="text-xs text-right">Unit ({viewPO.currency})</TableHead>}
+                      {isAdmin && <TableHead className="text-xs text-right">Line Total</TableHead>}
+                      {isAdmin && <TableHead className="text-xs text-right">PHP Value</TableHead>}
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {viewItems.map(item => {
+                      const orderedQty = Number(item.quantity || 0);
+                      const receivedQty = item.item_id ? Number(item.received_quantity || 0) : 0;
+                      const remainingQty = item.item_id ? Math.max(0, orderedQty - receivedQty) : orderedQty;
+                      const lineTotal = orderedQty * Number(item.unit_cost || 0);
+
+                      return (
+                        <TableRow key={item.id}>
+                          <TableCell className="font-mono text-xs font-medium text-primary">{item.items?.sku || "—"}</TableCell>
+                          <TableCell className="text-sm font-medium">{item.item_name}</TableCell>
+                          <TableCell className="max-w-[220px] text-sm text-muted-foreground">{item.description || "—"}</TableCell>
+                          <TableCell className="text-sm text-right">{orderedQty}</TableCell>
+                          <TableCell className="text-sm text-right">{item.item_id ? receivedQty : "—"}</TableCell>
+                          <TableCell className="text-sm text-right font-medium">{remainingQty}</TableCell>
+                          <TableCell className="text-sm">{item.received_date ? new Date(item.received_date).toLocaleDateString("en-US") : "—"}</TableCell>
+                          {isAdmin && <TableCell className="text-sm text-right">{Number(item.unit_cost || 0).toLocaleString("en", { minimumFractionDigits: 2 })}</TableCell>}
+                          {isAdmin && (
+                            <TableCell className="text-sm text-right font-medium">
+                              {viewPO.currency === "USD" ? "$" : "¥"}{lineTotal.toLocaleString("en", { minimumFractionDigits: 2 })}
+                            </TableCell>
+                          )}
+                          {isAdmin && <TableCell className="text-sm text-right">{peso(lineTotal * Number(viewPO.exchange_rate || 1))}</TableCell>}
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {isAdmin && (
+                <div className="rounded-lg bg-muted/50 p-3 space-y-1">
+                  <div className="flex justify-between text-sm">
+                    <span>Total ({viewPO.currency})</span>
+                    <span className="font-medium">{viewPO.currency === "USD" ? "$" : "¥"}{viewPO.total_amount.toLocaleString("en", { minimumFractionDigits: 2 })}</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span>Total (PHP)</span>
+                    <span className="font-semibold text-primary">{peso(viewPO.total_amount * viewPO.exchange_rate)}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Supplier receipt (hard copy). The whole panel takes a paste, so
+                  a screenshot from a chat thread can go straight in. */}
+              <div
+                className="rounded-lg border bg-card focus-within:ring-1 focus-within:ring-primary/40"
+                onPaste={handleReceiptPaste}
+                tabIndex={0}
+              >
+                <div className="border-b px-4 py-3 flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold flex items-center gap-2"><FileText className="h-4 w-4" /> Supplier Receipt</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Upload the receipt from the supplier (image or PDF), or click here and paste a screenshot.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label className="inline-flex">
+                      <input
+                        type="file"
+                        accept="image/*,application/pdf"
+                        className="hidden"
+                        disabled={uploadingReceipt}
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) handleReceiptUpload(f);
+                          e.target.value = "";
+                        }}
+                      />
+                      <Button asChild size="sm" variant="outline" className="rounded-lg h-8 px-3 text-xs cursor-pointer" disabled={uploadingReceipt}>
+                        <span><Upload className="h-3.5 w-3.5 mr-1.5" />{uploadingReceipt ? "Uploading..." : receiptPath ? "Replace" : "Upload"}</span>
+                      </Button>
+                    </label>
+                    {receiptPath && (
+                      <Button size="sm" variant="ghost" onClick={handleReceiptRemove} className="rounded-lg h-8 px-2 text-xs text-destructive hover:text-destructive">
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                <div className="p-4">
+                  {!receiptPath ? (
+                    <div className="rounded-md border border-dashed px-3 py-6 text-xs text-muted-foreground flex items-center gap-2">
+                      <ImageIcon className="h-4 w-4" />
+                      {uploadingReceipt ? "Uploading..." : "No receipt yet — paste a screenshot here (Ctrl/Cmd+V) or use Upload."}
+                    </div>
+                  ) : receiptSignedUrl ? (
+                    receiptPath.toLowerCase().endsWith(".pdf") ? (
+                      <div className="space-y-2">
+                        <iframe src={receiptSignedUrl} title="Receipt" className="w-full h-[480px] rounded border bg-background" />
+                        <a href={receiptSignedUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                          <ExternalLink className="h-3 w-3" /> Open in new tab
+                        </a>
+                      </div>
+                    ) : (
+                      <a href={receiptSignedUrl} target="_blank" rel="noreferrer" className="block">
+                        <img src={receiptSignedUrl} alt="Supplier receipt" className="max-h-[480px] rounded border bg-background" />
+                      </a>
+                    )
+                  ) : (
+                    <div className="text-xs text-muted-foreground py-4">Loading preview…</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Receive Dialog */}
+      <Dialog open={!!receiveOpen} onOpenChange={() => { setReceiveOpen(null); setReceiveQtys({}); setUndoQtys({}); setReceiveLocations({}); setReceiveDate(new Date().toISOString().split("T")[0]); }}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle className="text-lg">Receive / Undo Items</DialogTitle></DialogHeader>
+          {(() => {
+            const po: any = (orders as any[]).find((o: any) => o.id === receiveOpen);
+            const originalBranch = branches.find(b => b.id === po?.branch_id);
+            const changed = isAdmin && receiveBranchId && receiveBranchId !== po?.branch_id;
+            return (
+              <div className="rounded-md border bg-muted/40 p-3 space-y-2">
+                <div className="text-xs text-muted-foreground">Receiving into branch</div>
+                {isAdmin ? (
+                  <Select value={receiveBranchId} onValueChange={setReceiveBranchId}>
+                    <SelectTrigger className="h-9"><SelectValue placeholder="Select branch..." /></SelectTrigger>
+                    <SelectContent>
+                      {branches.map(b => (
+                        <SelectItem key={b.id} value={b.id}>{b.branch_name} ({b.branch_code})</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <div className="text-sm font-semibold">{originalBranch ? `${originalBranch.branch_name} (${originalBranch.branch_code})` : "—"}</div>
+                )}
+                {changed && <p className="text-[11px] text-amber-600">Branch differs from PO's original ({originalBranch?.branch_code || "—"}). The PO's branch will be updated on confirm.</p>}
+              </div>
+            );
+          })()}
+          <div className="flex items-end gap-3">
+            <div className="space-y-1.5 flex-1">
+              <Label className="text-xs">Date Received</Label>
+              <DateField value={receiveDate} onChange={setReceiveDate} />
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9"
+              onClick={() => {
+                const next: Record<string, number> = {};
+                receiveItems.forEach((pi: any) => {
+                  const remaining = Math.max(0, pi.quantity - (pi.received_quantity || 0));
+                  if (remaining > 0) next[pi.id] = remaining;
+                });
+                setReceiveQtys(next);
+              }}
+            >
+              Fill Remaining
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">Enter a quantity in <span className="font-medium text-foreground">Receive</span> to add to inventory, or in <span className="font-medium text-foreground">Undo</span> to reverse a prior receipt (deducts inventory). Every action is recorded as an inventory transaction.</p>
+          <div className="grid grid-cols-[1fr_120px_80px_80px] gap-2 px-3 pb-1 text-[10px] font-medium uppercase text-muted-foreground">
+            <span>Item</span>
+            <span className="text-center">Location</span>
+            <span className="text-center">Receive</span>
+            <span className="text-center">Undo</span>
+          </div>
+          <div className="space-y-3 max-h-[50vh] overflow-y-auto">
+            {receiveItems.length === 0 && (
+              <p className="text-xs text-muted-foreground italic px-3">No line items on this PO.</p>
+            )}
+            {receiveItems.map((pi: any) => {
+              const remaining = pi.quantity - (pi.received_quantity || 0);
+              const isCustom = !pi.item_id;
+              const isFull = remaining <= 0;
+              const receivedQty = Number(pi.received_quantity || 0);
+              const location = receiveLocations[pi.id] || "warehouse";
+              return (
+                <div key={pi.id} className="grid grid-cols-[1fr_120px_80px_80px] items-center gap-2 p-3 rounded-lg border bg-muted/30">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate">{pi.items?.name || pi.item_name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {isCustom
+                        ? `Custom item — not tracked in inventory · Ordered: ${pi.quantity} · Received: ${receivedQty}`
+                        : `Ordered: ${pi.quantity} · Received: ${receivedQty} · Remaining: ${remaining}`}
+                    </p>
+                    {pi.received_date && (
+                      <p className="text-[10px] text-muted-foreground mt-0.5">Last received: {new Date(pi.received_date).toLocaleDateString("en-US")}</p>
+                    )}
+                  </div>
+                  <Select
+                    value={location}
+                    onValueChange={(v) => setReceiveLocations({ ...receiveLocations, [pi.id]: v as "warehouse" | "store" })}
+                    disabled={isCustom || isFull}
+                  >
+                    <SelectTrigger className="h-9 text-sm"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="warehouse">Warehouse</SelectItem>
+                      <SelectItem value="store">Store</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={remaining}
+                    value={receiveQtys[pi.id] ?? ""}
+                    disabled={isFull}
+                    placeholder="0"
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value);
+                      const clamped = isNaN(v) ? 0 : Math.max(0, Math.min(v, remaining));
+                      setReceiveQtys({ ...receiveQtys, [pi.id]: clamped });
+                    }}
+                    className="h-9 text-sm text-center"
+                  />
+                  <Input
+                    type="number"
+                    min={0}
+                    max={receivedQty}
+                    value={undoQtys[pi.id] || 0}
+                    disabled={receivedQty <= 0 || isCustom}
+                    placeholder="0"
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value);
+                      const clamped = isNaN(v) ? 0 : Math.max(0, Math.min(v, receivedQty));
+                      setUndoQtys({ ...undoQtys, [pi.id]: clamped });
+                    }}
+                    className="h-9 text-sm text-center"
+                  />
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex gap-2 mt-2">
+            <Button onClick={() => receiveMut.mutate()} disabled={receiveMut.isPending || Object.values(receiveQtys).every((v) => !v)} className="flex-1 rounded-lg h-9">Confirm Receipt</Button>
+            <Button variant="outline" onClick={() => undoMut.mutate()} disabled={undoMut.isPending || Object.values(undoQtys).every((v) => !v)} className="flex-1 rounded-lg h-9 border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive">Undo Receipt</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {isAdmin && (
+        <div className="rounded-lg border bg-card p-4 flex items-center justify-between">
+          <div>
+            <p className="text-xs text-muted-foreground uppercase tracking-wide">Total Not Yet Received</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Value of outstanding items across all overseas POs (PHP equivalent)</p>
+          </div>
+          <p className="text-2xl font-semibold text-primary font-mono">{peso(notReceivedPhpTotal)}</p>
+        </div>
+      )}
+
+      <div className="data-table-wrapper">
+        {/* Phones get stacked cards; the eleven-column table below pushes amount
+            and ETA off-screen on a narrow display. */}
+        <div className="md:hidden space-y-2 p-2">
+          {isLoading ? (
+            <div className="h-32 flex items-center justify-center">
+              <div className="h-5 w-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : sortedOrders.length === 0 ? (
+            <div className="empty-state"><ShoppingCart className="empty-state-icon" /><p className="text-sm">No overseas purchase orders yet</p></div>
+          ) : (
+            sortedOrders.map((po) => {
+              const poItems = itemsByPo.get(po.id) || [];
+              const totalItems = poItems.length;
+              const fullyReceived = poItems.filter((i) => (i.received_quantity || 0) >= i.quantity).length;
+              const partialItems = poItems.filter((i) => (i.received_quantity || 0) > 0 && (i.received_quantity || 0) < i.quantity).length;
+              const totalOrderedQty = poItems.reduce((s, i) => s + (i.quantity || 0), 0);
+              const totalReceivedQty = poItems.reduce((s, i) => s + (i.received_quantity || 0), 0);
+              return (
+                <OverseasPOMobileCard
+                  key={po.id}
+                  po={po}
+                  branchName={branchNameById.get((po as any).branch_id) || ""}
+                  arrival={arrivalFor(po.id, po.expected_delivery)}
+                  isAdmin={isAdmin}
+                  selected={selectedIds.has(po.id)}
+                  onToggleSelect={() => toggleOne(po.id)}
+                  actions={renderOverseasPOActions(po)}
+                  itemsSummary={
+                    totalItems === 0 ? "—" : (
+                      <>
+                        {fullyReceived}/{totalItems} items
+                        {partialItems > 0 && <span className="text-warning"> · {partialItems} partial</span>}
+                        <span className="font-mono"> · {totalReceivedQty}/{totalOrderedQty} qty</span>
+                      </>
+                    )
+                  }
+                />
+              );
+            })
+          )}
+        </div>
+
+        <Table className="hidden md:table">
+          <TableHeader>
+            <TableRow>
+              {isAdmin && <TableHead className="w-10"><Checkbox checked={filteredOrders.length > 0 && filteredOrders.every((o) => selectedIds.has(o.id))} onCheckedChange={toggleAll} /></TableHead>}
+              <SortableHeader sortKey="po_number" label="PO #" sort={sort} onToggle={toggle} />
+              <SortableHeader sortKey="supplier" label="Supplier" sort={sort} onToggle={toggle} />
+              <SortableHeader sortKey="branch" label="Branch" sort={sort} onToggle={toggle} />
+              <SortableHeader sortKey="status" label="Status" sort={sort} onToggle={toggle} />
+              <SortableHeader sortKey="eta" label="ETA" sort={sort} onToggle={toggle} />
+              <TableHead className="text-xs">Items</TableHead>
+              {isAdmin && <SortableHeader sortKey="currency" label="Currency" sort={sort} onToggle={toggle} />}
+              {isAdmin && <SortableHeader sortKey="total_amount" label="Amount" sort={sort} onToggle={toggle} align="right" />}
+              {isAdmin && <SortableHeader sortKey="php_total" label="PHP Equiv." sort={sort} onToggle={toggle} align="right" />}
+              <TableHead className="text-xs text-right w-28">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {isLoading ? (
+              <TableRow><TableCell colSpan={11} className="h-32 text-center"><div className="flex justify-center"><div className="h-5 w-5 border-2 border-primary border-t-transparent rounded-full animate-spin" /></div></TableCell></TableRow>
+            ) : sortedOrders.length === 0 ? (
+              <TableRow><TableCell colSpan={11}><div className="empty-state"><ShoppingCart className="empty-state-icon" /><p className="text-sm">No overseas purchase orders yet</p></div></TableCell></TableRow>
+            ) : sortedOrders.map(po => {
+              const arrival = arrivalFor(po.id, po.expected_delivery);
+              const poItems = itemsByPo.get(po.id) || [];
+              const totalItems = poItems.length;
+              const fullyReceived = poItems.filter((i) => (i.received_quantity || 0) >= i.quantity).length;
+              const partialItems = poItems.filter((i) => (i.received_quantity || 0) > 0 && (i.received_quantity || 0) < i.quantity).length;
+              const totalOrderedQty = poItems.reduce((s, i) => s + (i.quantity || 0), 0);
+              const totalReceivedQty = poItems.reduce((s, i) => s + (i.received_quantity || 0), 0);
+              return (
+              <TableRow key={po.id} className={selectedIds.has(po.id) ? "bg-muted/40" : "hover:bg-muted/30"}>
+                {isAdmin && <TableCell><Checkbox checked={selectedIds.has(po.id)} onCheckedChange={() => toggleOne(po.id)} /></TableCell>}
+                <TableCell className="font-medium text-sm font-mono">{po.po_number}</TableCell>
+                <TableCell className="text-sm">{po.overseas_suppliers?.name || "—"}</TableCell>
+                <TableCell className="text-sm whitespace-nowrap">{branchNameById.get((po as any).branch_id) || "—"}</TableCell>
+                <TableCell><StatusBadge status={po.status} context="overseas_po" /></TableCell>
+                <TableCell className="text-sm whitespace-nowrap">
+                  {arrival ? (
+                    arrival.confirmed ? (
+                      <span className="text-success font-medium">
+                        ✓ {new Date(arrival.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground" title="Estimated — not yet confirmed as arrived">
+                        est. {new Date(arrival.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                      </span>
+                    )
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-sm whitespace-nowrap">
+                  {totalItems === 0 ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : (
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-medium">
+                        {fullyReceived}/{totalItems} items
+                        {partialItems > 0 && <span className="text-warning"> · {partialItems} partial</span>}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground font-mono">
+                        {totalReceivedQty}/{totalOrderedQty} qty
+                      </span>
+                    </div>
+                  )}
+                </TableCell>
+                {isAdmin && (
+                  <TableCell className="text-sm">
+                    <span className="inline-flex items-center rounded-md bg-accent px-2 py-0.5 text-xs font-medium">
+                      {po.currency === "USD" ? "$ USD" : "¥ RMB"}
+                    </span>
+                  </TableCell>
+                )}
+                {isAdmin && (
+                  <TableCell className="text-sm text-right font-mono">
+                    {po.currency === "USD" ? "$" : "¥"}{po.total_amount.toLocaleString("en", { minimumFractionDigits: 2 })}
+                  </TableCell>
+                )}
+                {isAdmin && (
+                  <TableCell className="text-sm text-right font-mono text-primary">
+                    {peso(po.total_amount * po.exchange_rate)}
+                  </TableCell>
+                )}
+                <TableCell className="text-right">
+                  <div className="flex justify-end gap-0.5">
+                    {renderOverseasPOActions(po)}
+                  </div>
+                </TableCell>
+              </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+
+      <DocumentPreview open={previewOpen} onClose={() => setPreviewOpen(false)} data={previewData} />
+        </TabsContent>
+        <TabsContent value="incoming" className="mt-0">
+      <section className="space-y-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold">Incoming Stocks</h2>
+            <p className="text-sm text-muted-foreground">
+              {filteredIncomingRows.length} item{filteredIncomingRows.length !== 1 ? "s" : ""}
+              {filteredIncomingRows.length !== incomingRows.length ? ` (filtered from ${incomingRows.length})` : ""}
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(260px,1fr)_180px_180px] xl:items-end">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Search ordered products..."
+                value={incomingSearch}
+                onChange={(e) => setIncomingSearch(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Supplier</Label>
+              <Select value={incomingSupplierFilter} onValueChange={setIncomingSupplierFilter}>
+                <SelectTrigger className="h-10">
+                  <SelectValue placeholder="All suppliers" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All suppliers</SelectItem>
+                  {suppliers.map((supplier) => (
+                    <SelectItem key={supplier.id} value={supplier.name}>{supplier.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Receiving Status</Label>
+              <Select value={incomingReceiptFilter} onValueChange={setIncomingReceiptFilter}>
+                <SelectTrigger className="h-10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="incoming">Still incoming</SelectItem>
+                  <SelectItem value="all">All ordered items</SelectItem>
+                  <SelectItem value="partial">Partially received</SelectItem>
+                  <SelectItem value="unreceived">Not yet received</SelectItem>
+                  <SelectItem value="received">Fully received</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-lg border bg-card p-4">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Ordered Qty</p>
+            <p className="mt-1 text-2xl font-semibold">
+              {filteredIncomingRows.reduce((sum, row) => sum + row.ordered_quantity, 0)}
+            </p>
+          </div>
+          <div className="rounded-lg border bg-card p-4">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Received Qty</p>
+            <p className="mt-1 text-2xl font-semibold">
+              {filteredIncomingRows.reduce((sum, row) => sum + row.received_quantity, 0)}
+            </p>
+          </div>
+          <div className="rounded-lg border bg-card p-4">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Remaining Qty</p>
+            <p className="mt-1 text-2xl font-semibold">
+              {filteredIncomingRows.reduce((sum, row) => sum + row.remaining_quantity, 0)}
+            </p>
+          </div>
+          {isAdmin && (
+            <div className="rounded-lg border bg-card p-4">
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">PHP Value</p>
+              <p className="mt-1 text-2xl font-semibold text-primary">
+                {peso(filteredIncomingRows.reduce((sum, row) => sum + row.php_value, 0))}
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="data-table-wrapper">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <SortableHeader sortKey="po_number" label="PO #" sort={incomingSort} onToggle={toggleIncomingSort} />
+                <SortableHeader sortKey="supplier" label="Supplier" sort={incomingSort} onToggle={toggleIncomingSort} />
+                <SortableHeader sortKey="product" label="Product" sort={incomingSort} onToggle={toggleIncomingSort} />
+                <SortableHeader sortKey="sku" label="SKU" sort={incomingSort} onToggle={toggleIncomingSort} />
+                <SortableHeader sortKey="ordered" label="Ordered" sort={incomingSort} onToggle={toggleIncomingSort} align="right" />
+                <SortableHeader sortKey="received" label="Received" sort={incomingSort} onToggle={toggleIncomingSort} align="right" />
+                <SortableHeader sortKey="remaining" label="Remaining" sort={incomingSort} onToggle={toggleIncomingSort} align="right" />
+                {isAdmin && <SortableHeader sortKey="unit_cost" label="Unit Cost" sort={incomingSort} onToggle={toggleIncomingSort} align="right" />}
+                {isAdmin && <SortableHeader sortKey="php_value" label="PHP Value" sort={incomingSort} onToggle={toggleIncomingSort} align="right" />}
+                <SortableHeader sortKey="expected_delivery" label="ETA" sort={incomingSort} onToggle={toggleIncomingSort} />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sortedIncomingRows.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={10}>
+                    <div className="empty-state">
+                      <ShoppingCart className="empty-state-icon" />
+                      <p className="text-sm">No ordered products match your filters</p>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ) : sortedIncomingRows.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-sm font-mono font-medium">{row.po_number}</TableCell>
+                  <TableCell className="text-sm">{row.supplier_name}</TableCell>
+                  <TableCell>
+                    <div className="min-w-[180px]">
+                      <p className="text-sm font-medium">{row.item_name}</p>
+                      <p className="text-xs text-muted-foreground">{row.description || "—"}</p>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-sm font-mono">{row.sku || "—"}</TableCell>
+                  <TableCell className="text-sm text-right">{row.ordered_quantity}</TableCell>
+                  <TableCell className="text-sm text-right">{row.received_quantity}</TableCell>
+                  <TableCell className="text-sm text-right font-medium">{row.remaining_quantity}</TableCell>
+                  {isAdmin && (
+                    <TableCell className="text-sm text-right font-mono">
+                      {row.currency === "USD" ? "$" : "¥"}{row.unit_cost.toLocaleString("en", { minimumFractionDigits: 2 })}
+                    </TableCell>
+                  )}
+                  {isAdmin && <TableCell className="text-sm text-right font-mono text-primary">{peso(row.php_value)}</TableCell>}
+                  <TableCell className="text-sm">{row.expected_delivery ? new Date(row.expected_delivery).toLocaleDateString("en-US") : "—"}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </section>
+        </TabsContent>
+
+        <TabsContent value="tracking" className="mt-0">
+          <section className="space-y-4">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Tracking</h2>
+                <p className="text-sm text-muted-foreground">
+                  {trackingRows.length} shipment{trackingRows.length === 1 ? "" : "s"} · warehouse receipt to arrival
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1 sm:w-[240px] sm:flex-none">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="Search tracking, PO, supplier..."
+                    value={trackSearch}
+                    onChange={(e) => setTrackSearch(e.target.value)}
+                    className="pl-9"
+                  />
+                </div>
+                <Select value={trackStatusFilter} onValueChange={(v) => setTrackStatusFilter(v as typeof trackStatusFilter)}>
+                  <SelectTrigger className="h-9 w-[150px] shrink-0"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All statuses</SelectItem>
+                    {Object.entries(TRACKING_STATUS_LABELS).map(([value, label]) => (
+                      <SelectItem key={value} value={value}>{label} only</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button onClick={() => openTrackCreate()} className="rounded-lg h-9 px-4 text-sm font-medium shrink-0">
+                  <Plus className="h-4 w-4 mr-1.5" /> Add Tracking
+                </Button>
+              </div>
+            </div>
+
+            {/* Phones get stacked cards; the eight-column table below hides the
+                two dates this tab exists to show. */}
+            <div className="md:hidden space-y-2">
+              {trackingRows.length === 0 ? (
+                <div className="rounded-xl border bg-card">
+                  <div className="empty-state"><Truck className="empty-state-icon" /><p className="text-sm">No shipments tracked yet</p></div>
+                </div>
+              ) : (
+                trackingRows.map(({ shipment: s, po_number, supplier }) => (
+                  <div key={s.id} className="rounded-xl border bg-card p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-mono text-xs font-semibold">{s.tracking_number || "—"}</div>
+                        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                          {po_number} · {supplier}
+                        </div>
+                      </div>
+                      <TrackingStatusBadge status={s.status} />
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                      <div>
+                        <div className="text-muted-foreground">In China warehouse</div>
+                        <div className="font-medium">{s.warehouse_received_date || "—"}</div>
+                      </div>
+                      <div>
+                        <div className="text-muted-foreground">Expected arrival</div>
+                        <div className="font-medium">{s.estimated_arrival || "—"}</div>
+                      </div>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2 border-t pt-2">
+                      <span className="text-[11px] text-muted-foreground">
+                        {s.actual_arrival ? `Arrived ${s.actual_arrival}` : s.shipping_method || "—"}
+                      </span>
+                      <div className="flex shrink-0 gap-0.5">
+                        <Button variant="ghost" size="icon" onClick={() => openTrackEdit(s)} className="h-8 w-8 rounded-md" aria-label="Edit">
+                          <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => trackDeleteMut.mutate(s.id)} className="h-8 w-8 rounded-md" aria-label="Delete">
+                          <Trash2 className="h-3.5 w-3.5 text-destructive/70" />
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="data-table-wrapper hidden md:block">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">Tracking #</TableHead>
+                    <TableHead className="text-xs">PO #</TableHead>
+                    <TableHead className="text-xs">Supplier</TableHead>
+                    <TableHead className="text-xs">Method</TableHead>
+                    <TableHead className="text-xs">In China Warehouse</TableHead>
+                    <TableHead className="text-xs">Expected Arrival</TableHead>
+                    <TableHead className="text-xs">Arrived</TableHead>
+                    <TableHead className="text-xs">Status</TableHead>
+                    <TableHead className="text-xs text-right w-24">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {trackingRows.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={9}>
+                        <div className="empty-state"><Truck className="empty-state-icon" /><p className="text-sm">No shipments tracked yet</p></div>
+                      </TableCell>
+                    </TableRow>
+                  ) : trackingRows.map(({ shipment: s, po_number, supplier }) => (
+                    <TableRow key={s.id} className="hover:bg-muted/30">
+                      <TableCell className="font-mono text-xs font-medium">{s.tracking_number || "—"}</TableCell>
+                      <TableCell className="text-sm">{po_number}</TableCell>
+                      <TableCell className="text-sm">{supplier}</TableCell>
+                      <TableCell className="text-sm text-muted-foreground">{s.shipping_method || "—"}</TableCell>
+                      <TableCell className="text-sm">{s.warehouse_received_date || "—"}</TableCell>
+                      <TableCell className="text-sm">{s.estimated_arrival || "—"}</TableCell>
+                      <TableCell className="text-sm text-muted-foreground">{s.actual_arrival || "—"}</TableCell>
+                      <TableCell><TrackingStatusBadge status={s.status} /></TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex justify-end gap-0.5">
+                          <Button variant="ghost" size="icon" onClick={() => openTrackEdit(s)} className="h-7 w-7 rounded-md"><Pencil className="h-3.5 w-3.5 text-muted-foreground" /></Button>
+                          <Button variant="ghost" size="icon" onClick={() => trackDeleteMut.mutate(s.id)} className="h-7 w-7 rounded-md"><Trash2 className="h-3.5 w-3.5 text-destructive/70" /></Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </section>
+        </TabsContent>
+      </Tabs>
+
+      <Dialog open={trackOpen} onOpenChange={setTrackOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader><DialogTitle>{trackEditing ? "Edit Tracking" : "Add Tracking"}</DialogTitle></DialogHeader>
+          <div className="grid gap-3 pt-1">
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Purchase Order</Label>
+              <Select
+                value={trackForm.po_id || NO_PO}
+                onValueChange={(v) => setTrackForm({ ...trackForm, po_id: v === NO_PO ? "" : v })}
+              >
+                <SelectTrigger className="h-9"><SelectValue placeholder="Not linked" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_PO}>Not linked to a PO</SelectItem>
+                  {orders.map((o: any) => (
+                    <SelectItem key={o.id} value={o.id}>
+                      {o.po_number}{o.overseas_suppliers?.name ? ` · ${o.overseas_suppliers.name}` : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Tracking Number *</Label>
+                <Input value={trackForm.tracking_number} onChange={(e) => setTrackForm({ ...trackForm, tracking_number: e.target.value })} className="h-9" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Method</Label>
+                <Input value={trackForm.shipping_method} onChange={(e) => setTrackForm({ ...trackForm, shipping_method: e.target.value })} className="h-9" placeholder="e.g. Sea, Air" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Received in China Warehouse</Label>
+                <DateField value={trackForm.warehouse_received_date} onChange={(v) => setTrackForm({ ...trackForm, warehouse_received_date: v })} placeholder="Optional" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Shipped Out</Label>
+                <DateField value={trackForm.ship_date} onChange={(v) => setTrackForm({ ...trackForm, ship_date: v })} placeholder="Optional" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Expected Arrival</Label>
+                <DateField value={trackForm.estimated_arrival} onChange={(v) => setTrackForm({ ...trackForm, estimated_arrival: v })} placeholder="Optional" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Arrived</Label>
+                <DateField value={trackForm.actual_arrival} onChange={(v) => setTrackForm({ ...trackForm, actual_arrival: v })} placeholder="Optional" />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Status</Label>
+              <Select value={trackForm.status} onValueChange={(v) => setTrackForm({ ...trackForm, status: v as ShipmentTracking["status"] })}>
+                <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {Object.entries(TRACKING_STATUS_LABELS).map(([value, label]) => (
+                    <SelectItem key={value} value={value}>{label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium">Notes</Label>
+              <Textarea value={trackForm.notes} onChange={(e) => setTrackForm({ ...trackForm, notes: e.target.value })} className="resize-none" rows={2} />
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <Button variant="outline" onClick={() => setTrackOpen(false)}>Cancel</Button>
+              <Button onClick={handleTrackSubmit} disabled={trackCreateMut.isPending || trackUpdateMut.isPending}>
+                {trackEditing ? "Save Changes" : "Add Tracking"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

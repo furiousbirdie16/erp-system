@@ -1,0 +1,414 @@
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { supabase } from "@/integrations/supabase/client";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Card, CardContent } from "@/components/ui/card";
+import { Search, History, ExternalLink } from "lucide-react";
+import type { Item } from "@/types/database";
+import InvoiceDetailsDialog from "@/components/InvoiceDetailsDialog";
+import OnlineSaleDetailsDialog from "@/components/OnlineSaleDetailsDialog";
+import { useBranch } from "@/contexts/BranchContext";
+
+interface Props {
+  item: Item | null;
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+}
+
+type MovementCategory =
+  | "stock_received"
+  | "sale"
+  | "return"
+  | "adjustment"
+  | "transfer"
+  | "correction";
+
+interface LedgerRow {
+  id: string;
+  created_at: string;
+  category: MovementCategory;
+  label: string;
+  qty_in: number;
+  qty_out: number;
+  signed_delta: number;
+  previous_balance: number;
+  new_balance: number;
+  open_before: number | null;
+  open_after: number | null;
+  dest_before: number | null;
+  dest_after: number | null;
+  location: string | null;
+  dest_location: string | null;
+  unit: string | null;
+  reference_no: string;
+  reference_link: string | null;
+  reference_kind: "invoice" | "purchase_order" | "overseas_purchase_order" | "online_sale" | null;
+  reference_id: string | null;
+  notes: string;
+  user: string;
+  branch_id: string | null;
+  branch_label: string;
+}
+
+
+const CATEGORY_LABELS: Record<MovementCategory, string> = {
+  stock_received: "Stock Received",
+  sale: "Sale",
+  return: "Customer Return",
+  adjustment: "Stock Adjustment",
+  transfer: "Warehouse Transfer",
+  correction: "Manual Correction",
+};
+
+const CATEGORY_COLORS: Record<MovementCategory, string> = {
+  stock_received: "bg-emerald-100 text-emerald-700 border-emerald-200",
+  sale: "bg-blue-100 text-blue-700 border-blue-200",
+  return: "bg-amber-100 text-amber-700 border-amber-200",
+  adjustment: "bg-purple-100 text-purple-700 border-purple-200",
+  transfer: "bg-slate-100 text-slate-700 border-slate-200",
+  correction: "bg-rose-100 text-rose-700 border-rose-200",
+};
+
+function classify(type: string, reference_type: string | null): { category: MovementCategory; label: string; direction: "in" | "out" | "neutral" } {
+  // Returns from invoices/online sales come back as in_po with specific reference_types
+  const returnTypes = ["invoice_delete", "invoice_cancel", "invoice_revert", "online_sale_delete", "online_sale_cancelled", "online_sale_returned"];
+  if (type === "in_po" && reference_type && returnTypes.includes(reference_type)) {
+    const label =
+      reference_type === "online_sale_returned" ? "Customer Return (Online)" :
+      reference_type === "invoice_cancel" ? "Invoice Cancelled" :
+      reference_type === "invoice_revert" ? "Invoice Reverted" :
+      reference_type === "invoice_delete" ? "Invoice Deleted" :
+      reference_type === "online_sale_cancelled" ? "Online Sale Cancelled" :
+      "Online Sale Deleted";
+    return { category: "return", label, direction: "in" };
+  }
+  if (type === "in_po") return { category: "stock_received", label: "Stock Received", direction: "in" };
+  if (type === "out_invoice") return { category: "sale", label: "Invoice Sale", direction: "out" };
+  if (type === "out_online_sale") return { category: "sale", label: "Online Sale", direction: "out" };
+  if (type === "adjust_surplus") return { category: "adjustment", label: "Adjustment (Surplus)", direction: "in" };
+  if (type === "adjust_missing") return { category: "adjustment", label: "Adjustment (Missing)", direction: "out" };
+  if (type === "transfer_w2s") return { category: "transfer", label: "Warehouse → Store", direction: "neutral" };
+  if (type === "transfer_s2w") return { category: "transfer", label: "Store → Warehouse", direction: "neutral" };
+  return { category: "correction", label: type, direction: "neutral" };
+}
+
+async function fetchLedger(itemId: string, currentQty: number, branchId: string | null): Promise<LedgerRow[]> {
+  // Paginate: Supabase caps rows per request (1000), which previously truncated
+  // the ledger to the oldest 1000 movements.
+  const PAGE = 1000;
+  const rows: any[] = [];
+  for (let page = 0; page < 50; page++) {
+    let q = supabase
+      .from("inventory_movements")
+      .select("id, created_at, type, reference_type, reference_id, quantity, notes, unit, location, dest_location, balance_before, balance_after, open_before, open_after, dest_balance_before, dest_balance_after, user_email, branch_id")
+      .eq("item_id", itemId)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (branchId) q = q.eq("branch_id", branchId);
+    const { data, error } = await q;
+    if (error) break;
+    const batch = data || [];
+    rows.push(...batch);
+    if (batch.length < PAGE) break;
+  }
+
+
+  // Resolve reference document numbers
+  const invoiceIds = new Set<string>();
+  const poIds = new Set<string>();
+  const oposIds = new Set<string>();
+  const onlineSaleIds = new Set<string>();
+
+  for (const m of rows) {
+    if (!m.reference_id) continue;
+    const rt = m.reference_type || "";
+    if (rt.startsWith("invoice")) invoiceIds.add(m.reference_id);
+    else if (rt.startsWith("purchase_order")) poIds.add(m.reference_id);
+    else if (rt.startsWith("overseas_purchase_order")) oposIds.add(m.reference_id);
+    else if (rt.startsWith("online_sale")) onlineSaleIds.add(m.reference_id);
+  }
+
+  // Chunk id lookups so long URLs / row caps don't drop references
+  const fetchRefs = async (table: string, col: string, ids: Set<string>) => {
+    const out: any[] = [];
+    const arr = Array.from(ids);
+    for (let i = 0; i < arr.length; i += 150) {
+      const { data } = await (supabase as any).from(table).select(`id, ${col}`).in("id", arr.slice(i, i + 150));
+      out.push(...(data || []));
+    }
+    return out;
+  };
+
+  const [invRows, poRows, oposRows, osRows] = await Promise.all([
+    fetchRefs("invoices", "invoice_number", invoiceIds),
+    fetchRefs("purchase_orders", "po_number", poIds),
+    fetchRefs("overseas_purchase_orders", "po_number", oposIds),
+    fetchRefs("online_sales", "order_number", onlineSaleIds),
+  ]);
+
+  const refMap = new Map<string, { number: string; link: string; kind: LedgerRow["reference_kind"] }>();
+  invRows.forEach((r: any) => refMap.set(r.id, { number: r.invoice_number, link: `/invoices?focus=${r.id}`, kind: "invoice" }));
+  poRows.forEach((r: any) => refMap.set(r.id, { number: r.po_number, link: `/purchase-orders?focus=${r.id}`, kind: "purchase_order" }));
+  oposRows.forEach((r: any) => refMap.set(r.id, { number: r.po_number, link: `/overseas-purchase-orders?focus=${r.id}`, kind: "overseas_purchase_order" }));
+  osRows.forEach((r: any) => refMap.set(r.id, { number: r.order_number, link: `/online-sales?focus=${r.id}`, kind: "online_sale" }));
+
+
+  // Load branch labels for rows we retrieved
+  const branchIds = Array.from(new Set(rows.map((m: any) => m.branch_id).filter(Boolean)));
+  const branchMap = new Map<string, string>();
+  if (branchIds.length) {
+    const { data: bs } = await (supabase as any)
+      .from("branches")
+      .select("id, branch_code")
+      .in("id", branchIds);
+    (bs || []).forEach((b: any) => branchMap.set(b.id, b.branch_code));
+  }
+
+  // Compute signed deltas
+  const enriched = rows.map((m: any) => {
+    const info = classify(m.type as string, m.reference_type);
+    const qty = Number(m.quantity || 0);
+    const qtyIn = info.direction === "in" ? qty : 0;
+    const qtyOut = info.direction === "out" ? qty : 0;
+    const signed = qtyIn - qtyOut;
+    const ref = m.reference_id ? refMap.get(m.reference_id) : null;
+    return { m, info, qty, qtyIn, qtyOut, signed, ref };
+  });
+
+  // Walk backward from current quantity to derive previous/new balances (fallback
+  // for legacy rows without snapshots). New rows carry their own balance snapshot.
+  let runningNew = currentQty;
+  const result: LedgerRow[] = [];
+  for (let i = enriched.length - 1; i >= 0; i--) {
+    const e = enriched[i];
+    const m: any = e.m;
+    const snapshotBefore = m.balance_before != null ? Number(m.balance_before) : null;
+    const snapshotAfter = m.balance_after != null ? Number(m.balance_after) : null;
+    const newBalance = snapshotAfter ?? runningNew;
+    const previousBalance = snapshotBefore ?? (newBalance - e.signed);
+    result.push({
+      id: m.id,
+      created_at: m.created_at,
+      category: e.info.category,
+      label: e.info.label,
+      qty_in: e.qtyIn,
+      qty_out: e.qtyOut,
+      signed_delta: e.signed,
+      previous_balance: previousBalance,
+      new_balance: newBalance,
+      open_before: m.open_before != null ? Number(m.open_before) : null,
+      open_after: m.open_after != null ? Number(m.open_after) : null,
+      dest_before: m.dest_balance_before != null ? Number(m.dest_balance_before) : null,
+      dest_after: m.dest_balance_after != null ? Number(m.dest_balance_after) : null,
+      location: m.location || null,
+      dest_location: m.dest_location || null,
+      unit: m.unit || null,
+      reference_no: e.ref?.number || "—",
+      reference_link: e.ref?.link || null,
+      reference_kind: e.ref?.kind || null,
+      reference_id: m.reference_id || null,
+      notes: m.notes || "",
+      user: m.user_email || "—",
+      branch_id: m.branch_id || null,
+      branch_label: m.branch_id ? (branchMap.get(m.branch_id) || "—") : "—",
+    });
+    runningNew = previousBalance;
+  }
+  return result; // newest first
+}
+
+
+export default function ItemHistoryDialog({ item, open, onOpenChange }: Props) {
+  const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<"all" | MovementCategory>("all");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [invoiceDetailId, setInvoiceDetailId] = useState<string | null>(null);
+  const [onlineSaleDetailId, setOnlineSaleDetailId] = useState<string | null>(null);
+  const { activeBranchId, activeBranch, canPickAll } = useBranch();
+
+  const { data: ledger = [], isLoading } = useQuery({
+    queryKey: ["item-ledger", item?.id, item?.quantity, activeBranchId],
+    queryFn: () => fetchLedger(item!.id, Number(item!.quantity || 0), activeBranchId),
+    enabled: !!item && open,
+  });
+
+
+  const filtered = useMemo(() => ledger.filter((r) => {
+    if (categoryFilter !== "all" && r.category !== categoryFilter) return false;
+    const day = r.created_at.slice(0, 10);
+    if (from && day < from) return false;
+    if (to && day > to) return false;
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      if (!r.reference_no.toLowerCase().includes(q) && !r.notes.toLowerCase().includes(q) && !r.label.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  }), [ledger, categoryFilter, from, to, search]);
+
+  const stats = useMemo(() => {
+    if (ledger.length === 0) return null;
+    const totalIn = ledger.reduce((s, r) => s + r.qty_in, 0);
+    const totalOut = ledger.reduce((s, r) => s + r.qty_out, 0);
+    return { totalIn, totalOut, current: item?.quantity ?? 0, count: ledger.length };
+  }, [ledger, item]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-6xl max-h-[90vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle className="text-lg">
+            Inventory Ledger — {item?.name}
+            <span className="ml-2 text-xs font-normal text-muted-foreground">
+              ({activeBranch ? `${activeBranch.branch_name} (${activeBranch.branch_code})` : canPickAll ? "All branches" : "—"})
+            </span>
+          </DialogTitle>
+        </DialogHeader>
+
+        {stats && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <Card><CardContent className="p-3"><div className="text-[10px] uppercase text-muted-foreground">Movements</div><div className="text-lg font-semibold">{stats.count}</div></CardContent></Card>
+            <Card><CardContent className="p-3"><div className="text-[10px] uppercase text-muted-foreground">Total In</div><div className="text-lg font-semibold text-emerald-600">+{stats.totalIn}</div></CardContent></Card>
+            <Card><CardContent className="p-3"><div className="text-[10px] uppercase text-muted-foreground">Total Out</div><div className="text-lg font-semibold text-rose-600">−{stats.totalOut}</div></CardContent></Card>
+            <Card><CardContent className="p-3"><div className="text-[10px] uppercase text-muted-foreground">Current Stock</div><div className="text-lg font-semibold">{stats.current}</div></CardContent></Card>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-[1fr_180px_140px_140px] gap-2">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+            <Input placeholder="Search reference, notes, type..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-7 h-9 text-sm" />
+          </div>
+          <Select value={categoryFilter} onValueChange={(v) => setCategoryFilter(v as any)}>
+            <SelectTrigger className="h-9 text-sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Transactions</SelectItem>
+              <SelectItem value="stock_received">Stock Received</SelectItem>
+              <SelectItem value="sale">Sales</SelectItem>
+              <SelectItem value="return">Returns</SelectItem>
+              <SelectItem value="adjustment">Adjustments</SelectItem>
+              <SelectItem value="transfer">Transfers</SelectItem>
+              <SelectItem value="correction">Corrections</SelectItem>
+            </SelectContent>
+          </Select>
+          <div>
+            <Label className="text-[10px] text-muted-foreground">From</Label>
+            <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="h-9 text-sm" />
+          </div>
+          <div>
+            <Label className="text-[10px] text-muted-foreground">To</Label>
+            <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="h-9 text-sm" />
+          </div>
+        </div>
+
+        <div className="border rounded-md overflow-auto flex-1">
+          <Table>
+            <TableHeader className="sticky top-0 bg-background z-10">
+              <TableRow>
+                <TableHead className="text-xs whitespace-nowrap">Date & Time</TableHead>
+                <TableHead className="text-xs">Branch</TableHead>
+                <TableHead className="text-xs">Transaction</TableHead>
+                <TableHead className="text-xs">Reference</TableHead>
+                <TableHead className="text-xs">Location</TableHead>
+                <TableHead className="text-xs text-right">Qty In</TableHead>
+                <TableHead className="text-xs text-right">Qty Out</TableHead>
+                <TableHead className="text-xs">Unit</TableHead>
+                <TableHead className="text-xs text-right">Bal Before</TableHead>
+                <TableHead className="text-xs text-right">Bal After</TableHead>
+                <TableHead className="text-xs">User</TableHead>
+                <TableHead className="text-xs">Remarks</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isLoading ? (
+                <TableRow><TableCell colSpan={12} className="h-24 text-center text-sm text-muted-foreground">Loading ledger...</TableCell></TableRow>
+              ) : filtered.length === 0 ? (
+                <TableRow><TableCell colSpan={12} className="h-24 text-center"><div className="flex flex-col items-center gap-1 text-muted-foreground"><History className="h-5 w-5" /><span className="text-sm">No movements found</span></div></TableCell></TableRow>
+              ) : filtered.map((r) => {
+                const locLabel = r.category === "transfer" && r.dest_location
+                  ? `${r.location || "?"} → ${r.dest_location}`
+                  : (r.location || "—");
+                const transferDetail = r.category === "transfer" && r.dest_before != null && r.dest_after != null
+                  ? ` · dest ${r.dest_before}→${r.dest_after}`
+                  : "";
+                const openDetail = (r.open_before != null && r.open_after != null && (r.open_before !== 0 || r.open_after !== 0))
+                  ? ` · open ${r.open_before}→${r.open_after}${r.unit || "m"}`
+                  : "";
+                return (
+                <TableRow key={r.id}>
+                  <TableCell className="text-xs whitespace-nowrap">{new Date(r.created_at).toLocaleString()}</TableCell>
+                  <TableCell className="text-xs font-mono">{r.branch_label}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className={`text-[10px] ${CATEGORY_COLORS[r.category]}`}>{r.label}</Badge>
+                  </TableCell>
+                  <TableCell className="text-xs font-mono">
+                    {r.reference_kind === "invoice" && r.reference_id ? (
+                      <button
+                        type="button"
+                        onClick={() => setInvoiceDetailId(r.reference_id)}
+                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                        title="View invoice details"
+                      >
+                        {r.reference_no}<ExternalLink className="h-3 w-3" />
+                      </button>
+                    ) : r.reference_kind === "online_sale" && r.reference_id ? (
+                      <button
+                        type="button"
+                        onClick={() => setOnlineSaleDetailId(r.reference_id)}
+                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                        title="View online sale details"
+                      >
+                        {r.reference_no}<ExternalLink className="h-3 w-3" />
+                      </button>
+                    ) : r.reference_link && r.reference_no !== "—" ? (
+                      <Link to={r.reference_link} className="inline-flex items-center gap-1 text-primary hover:underline" onClick={() => onOpenChange(false)}>
+                        {r.reference_no}<ExternalLink className="h-3 w-3" />
+                      </Link>
+                    ) : (
+                      <span className="text-muted-foreground">{r.reference_no}</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs capitalize">{locLabel}</TableCell>
+                  <TableCell className="text-sm text-right text-emerald-600 font-medium">{r.qty_in > 0 ? `+${r.qty_in}` : ""}</TableCell>
+                  <TableCell className="text-sm text-right text-rose-600 font-medium">{r.qty_out > 0 ? `−${r.qty_out}` : ""}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{r.unit || "—"}</TableCell>
+                  <TableCell className="text-sm text-right tabular-nums">{r.previous_balance}</TableCell>
+                  <TableCell className="text-sm text-right tabular-nums font-semibold">{r.new_balance}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[140px] truncate" title={r.user}>{r.user}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[240px] truncate" title={`${r.notes}${transferDetail}${openDetail}`}>
+                    {r.notes}{transferDetail || openDetail ? <span className="text-[10px] italic">{transferDetail}{openDetail}</span> : null}
+                  </TableCell>
+                </TableRow>
+                );
+              })}
+
+            </TableBody>
+          </Table>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          Running balance is calculated from the current stock ({item?.quantity ?? 0}) working backwards through every recorded movement. The newest row's New Balance always matches current inventory.
+        </p>
+      </DialogContent>
+      <InvoiceDetailsDialog
+        invoiceId={invoiceDetailId}
+        highlightItemId={item?.id || null}
+        open={!!invoiceDetailId}
+        onOpenChange={(o) => { if (!o) setInvoiceDetailId(null); }}
+      />
+      <OnlineSaleDetailsDialog
+        onlineSaleId={onlineSaleDetailId}
+        highlightItemId={item?.id || null}
+        open={!!onlineSaleDetailId}
+        onOpenChange={(o) => { if (!o) setOnlineSaleDetailId(null); }}
+      />
+    </Dialog>
+  );
+}
