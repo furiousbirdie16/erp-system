@@ -2640,6 +2640,7 @@ export type Database = {
       }
       generate_asset_snapshot: { Args: never; Returns: undefined }
       get_default_branch_id: { Args: never; Returns: string }
+      has_any_user: { Args: never; Returns: boolean }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]
