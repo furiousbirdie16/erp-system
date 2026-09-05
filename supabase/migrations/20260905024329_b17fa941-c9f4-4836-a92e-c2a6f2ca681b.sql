@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS public.invoice_item_financials_backup_20260809;
+DROP TABLE IF EXISTS public.online_sale_financials_backup_20260809;

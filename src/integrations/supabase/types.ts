@@ -738,48 +738,6 @@ export type Database = {
           },
         ]
       }
-      invoice_item_financials_backup_20260809: {
-        Row: {
-          cost_snapshot: number | null
-          created_at: string | null
-          id: string | null
-          invoice_id: string | null
-          item_id: string | null
-          line_profit: number | null
-          line_total_cost: number | null
-          quantity: number | null
-          unit_price: number | null
-          updated_at: string | null
-          variation_id: string | null
-        }
-        Insert: {
-          cost_snapshot?: number | null
-          created_at?: string | null
-          id?: string | null
-          invoice_id?: string | null
-          item_id?: string | null
-          line_profit?: number | null
-          line_total_cost?: number | null
-          quantity?: number | null
-          unit_price?: number | null
-          updated_at?: string | null
-          variation_id?: string | null
-        }
-        Update: {
-          cost_snapshot?: number | null
-          created_at?: string | null
-          id?: string | null
-          invoice_id?: string | null
-          item_id?: string | null
-          line_profit?: number | null
-          line_total_cost?: number | null
-          quantity?: number | null
-          unit_price?: number | null
-          updated_at?: string | null
-          variation_id?: string | null
-        }
-        Relationships: []
-      }
       invoice_items: {
         Row: {
           id: string
@@ -1519,63 +1477,6 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
-      }
-      online_sale_financials_backup_20260809: {
-        Row: {
-          amount_paid: number | null
-          cost_snapshot: number | null
-          created_at: string | null
-          gross_margin: number | null
-          has_cost: boolean | null
-          id: string | null
-          is_paid: boolean | null
-          item_id: string | null
-          line_profit: number | null
-          line_total_cost: number | null
-          online_sale_id: string | null
-          paid_at: string | null
-          quantity: number | null
-          unit_price: number | null
-          updated_at: string | null
-          variation_id: string | null
-        }
-        Insert: {
-          amount_paid?: number | null
-          cost_snapshot?: number | null
-          created_at?: string | null
-          gross_margin?: number | null
-          has_cost?: boolean | null
-          id?: string | null
-          is_paid?: boolean | null
-          item_id?: string | null
-          line_profit?: number | null
-          line_total_cost?: number | null
-          online_sale_id?: string | null
-          paid_at?: string | null
-          quantity?: number | null
-          unit_price?: number | null
-          updated_at?: string | null
-          variation_id?: string | null
-        }
-        Update: {
-          amount_paid?: number | null
-          cost_snapshot?: number | null
-          created_at?: string | null
-          gross_margin?: number | null
-          has_cost?: boolean | null
-          id?: string | null
-          is_paid?: boolean | null
-          item_id?: string | null
-          line_profit?: number | null
-          line_total_cost?: number | null
-          online_sale_id?: string | null
-          paid_at?: string | null
-          quantity?: number | null
-          unit_price?: number | null
-          updated_at?: string | null
-          variation_id?: string | null
-        }
-        Relationships: []
       }
       online_sales: {
         Row: {
