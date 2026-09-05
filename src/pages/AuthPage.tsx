@@ -35,8 +35,8 @@ export default function AuthPage() {
     <div className="min-h-screen flex items-center justify-center bg-background p-4">
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
-          <img src="/images/logo.png" alt="IT SHOPPE" className="h-12 w-12 mb-3 object-contain" />
-          <h1 className="text-xl font-bold text-foreground">IT SHOPPE</h1>
+          <img src="/images/logo.png" alt="Inventory Manager" className="h-12 w-12 mb-3 object-contain" />
+          <h1 className="text-xl font-bold text-foreground">Inventory Manager</h1>
           <p className="text-sm text-muted-foreground mt-1">Sign in to your account</p>
         </div>
 
