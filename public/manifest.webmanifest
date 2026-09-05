@@ -1,7 +1,7 @@
 {
-  "name": "IT SHOPPE",
-  "short_name": "IT SHOPPE",
-  "description": "Inventory, sales and finance management for IT SHOPPE.",
+  "name": "Inventory Manager",
+  "short_name": "Inventory",
+  "description": "Inventory, purchasing, sales and finance management starter template.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
